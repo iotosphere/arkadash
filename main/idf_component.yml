@@ -1,0 +1,10 @@
+dependencies:
+  idf: ">=5.4.0"
+  lvgl/lvgl:
+    version: "^9.*"
+  espressif/esp_lvgl_port:
+    version: "^2.*"
+  espressif/es8311:
+    version: "^1.*"
+  espressif/esp_websocket_client:
+    version: "^1.*"

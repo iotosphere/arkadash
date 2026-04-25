@@ -1,0 +1,24 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPathWin": "c:\\Espressif\\v5.5.1\\esp-idf",
+  "idf.pythonInstallPath": "/usr/local/opt/python@3.12/bin/python3",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-bridge.cfg"
+  ],
+  "idf.portWin": "COM11",
+  "idf.toolsPathWin": "c:\\Espressif\\tools",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=C:\\Espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
+    "--compile-commands-dir=${workspaceFolder}\\build"
+  ],
+  "idf.flashType": "UART",
+  "idf.espIdfPath": "/Users/serhatsaday/esp/v5.5.1/esp-idf",
+  "idf.toolsPath": "/Users/serhatsaday/.espressif",
+  "idf.port": "/dev/tty.usbmodem5AB01729681",
+  "idf.currentSetup": "/Users/serhatsaday/esp/esp-idf"
+}
