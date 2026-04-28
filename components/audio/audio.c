@@ -56,9 +56,9 @@ static esp_err_t es8311_init_codec(void)
 
     ESP_ERROR_CHECK(es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
     ESP_ERROR_CHECK(es8311_sample_frequency_config(es_handle, EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE, EXAMPLE_SAMPLE_RATE));
-    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, EXAMPLE_VOICE_VOLUME, NULL));
+    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, 90, NULL));  // Higher volume
     ESP_ERROR_CHECK(es8311_microphone_config(es_handle, false));
-    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, EXAMPLE_MIC_GAIN));
+    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, 6));  // Higher mic gain
 
     ESP_LOGI(TAG, "ES8311 initialized");
     return ESP_OK;
@@ -171,11 +171,7 @@ esp_err_t audio_play(const uint8_t *buffer, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Ensure TX is properly enabled before writing
-    i2s_channel_disable(tx_handle);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    i2s_channel_enable(tx_handle);
-    
+    // TX should already be enabled from init - just ensure it's ready
     size_t total_written = 0;
     const size_t chunk = 4096;
     
@@ -193,9 +189,6 @@ esp_err_t audio_play(const uint8_t *buffer, size_t len)
             break;
         }
     }
-    
-    // Disable TX after playback
-    i2s_channel_disable(tx_handle);
     
     ESP_LOGI(TAG, "Playback complete, wrote %d bytes", (int)total_written);
     return ESP_OK;

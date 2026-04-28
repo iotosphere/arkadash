@@ -10,6 +10,9 @@ esp_err_t ws_disconnect(void);
 esp_err_t ws_deinit(void);
 bool ws_is_connected(void);
 esp_err_t ws_send_audio(const uint8_t *audio_buf, size_t audio_len);
+esp_err_t ws_send_text(const char *text);
+void ws_set_agent_mode(bool agent_mode);
+bool ws_is_agent_mode(void);
 
 void ws_set_audio_buffer(uint8_t *buf, size_t len);
 void ws_set_waiting(bool waiting);

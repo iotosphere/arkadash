@@ -1,6 +1,8 @@
 #include <string.h>
 
 #include "screens.h"
+#include "../websocket_client/include/websocket_client.h"
+#include "esp_log.h"
 #include "images.h"
 #include "fonts.h"
 #include "actions.h"
@@ -914,63 +916,15 @@ void create_screen_chat() {
             }
         }
         {
-            // aivoice
-            lv_obj_t *obj = lv_obj_create(parent_obj);
+            // aivoice - simple animation display
+            lv_obj_t *obj = lv_label_create(parent_obj);
             objects.aivoice = obj;
-            lv_obj_set_pos(obj, -1, 34);
-            lv_obj_set_size(obj, 240, 110);
-            lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_border_color(obj, lv_color_hex(0xfff50303), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_outline_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_outline_color(obj, lv_color_hex(0xffff0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_border_width(obj, 1, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_clip_corner(obj, true, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(obj, lv_color_hex(0xff000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_radius(obj, 25, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-            {
-                lv_obj_t *parent_obj2 = obj;
-                // KITT-style 3 bar animation (center bar taller)
-                // Left bar
-                lv_obj_t *bar_left = lv_bar_create(parent_obj2);
-                objects.kitt_bar_left = bar_left;
-                lv_obj_set_pos(bar_left, 60, 20);
-                lv_obj_set_size(bar_left, 20, 70);
-                lv_bar_set_range(bar_left, 0, 100);
-                lv_bar_set_value(bar_left, 0, LV_ANIM_OFF);
-                lv_obj_set_style_bg_color(bar_left, lv_color_hex(0xff1a1a1a), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_bg_color(bar_left, lv_color_hex(0xffff0000), LV_PART_INDICATOR | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_left, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_left, 3, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-                
-                // Center bar (taller)
-                lv_obj_t *bar_center = lv_bar_create(parent_obj2);
-                objects.kitt_bar_center = bar_center;
-                lv_obj_set_pos(bar_center, 100, 5);
-                lv_obj_set_size(bar_center, 20, 100);
-                lv_bar_set_range(bar_center, 0, 100);
-                lv_bar_set_value(bar_center, 0, LV_ANIM_OFF);
-                lv_obj_set_style_bg_color(bar_center, lv_color_hex(0xff1a1a1a), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_bg_color(bar_center, lv_color_hex(0xffff0000), LV_PART_INDICATOR | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_center, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_center, 3, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-                
-                // Right bar
-                lv_obj_t *bar_right = lv_bar_create(parent_obj2);
-                objects.kitt_bar_right = bar_right;
-                lv_obj_set_pos(bar_right, 140, 20);
-                lv_obj_set_size(bar_right, 20, 70);
-                lv_bar_set_range(bar_right, 0, 100);
-                lv_bar_set_value(bar_right, 0, LV_ANIM_OFF);
-                lv_obj_set_style_bg_color(bar_right, lv_color_hex(0xff1a1a1a), LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_bg_color(bar_right, lv_color_hex(0xffff0000), LV_PART_INDICATOR | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_right, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
-                lv_obj_set_style_radius(bar_right, 3, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-            }
+            lv_obj_set_pos(obj, 0, 40);
+            lv_obj_set_size(obj, 240, 100);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0xff0000ff), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_font(obj, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_label_set_text(obj, "🎤 Ses bekleniyor...");
         }
         {
             // microphone
@@ -1006,8 +960,17 @@ void create_screen_chat() {
 }
 
 void tick_screen_chat() {
+    static bool s_was_agent_mode = false;
     void *flowState = getFlowState(0, 3);
     (void)flowState;
+    
+    /* Switch from Agent to Chat mode */
+    if (s_was_agent_mode) {
+        ws_set_agent_mode(false);
+        ws_send_text("CHAT_START");
+        s_was_agent_mode = false;
+        ESP_LOGI("screens", "Switched to Chat mode (MiniMax)");
+    }
 }
 
 void create_screen_agent() {
@@ -1052,6 +1015,61 @@ void create_screen_agent() {
             lv_label_set_text(obj, "Agent");
         }
         {
+            // aivoice (Agent mode - simple label)
+            lv_obj_t *obj = lv_obj_create(parent_obj);
+            objects.aivoice = obj;
+            lv_obj_set_pos(obj, 20, 50);
+            lv_obj_set_size(obj, 200, 80);
+            lv_obj_set_style_radius(obj, 15, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_color(obj, lv_color_hex(0xff9400d3), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(obj, 2, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0xff1a0a2a), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(obj, 200, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+            {
+                lv_obj_t *parent_obj2 = obj;
+                lv_obj_t *label = lv_label_create(parent_obj2);
+                lv_obj_center(label);
+                lv_obj_set_size(label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+                lv_label_set_text(label, "🤖 Agent Mode\nZeroClaw Ready");
+                lv_obj_set_style_text_color(label, lv_color_hex(0xffaa00ff), LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_font(label, &lv_font_montserrat_14, LV_PART_MAIN | LV_STATE_DEFAULT);
+                lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+            }
+        }
+        {
+            // microphone
+            lv_obj_t *obj = lv_obj_create(parent_obj);
+            objects.microphone = obj;
+            lv_obj_set_pos(obj, 0, 160);
+            lv_obj_set_size(obj, 239, 100);
+            lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0xffacacac), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_opa(obj, 70, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_color(obj, lv_color_hex(0xff9400d3), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_radius(obj, 25, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_border_width(obj, 3, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_shadow_width(obj, 10, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_shadow_color(obj, lv_color_hex(0xff9400d3), LV_PART_MAIN | LV_STATE_DEFAULT);
+            // Add click event for recording
+            lv_obj_add_event_cb(obj, event_handler_cb_agent_agent, LV_EVENT_CLICKED, flowState);
+            {
+                lv_obj_t *parent_obj = obj;
+                {
+                    // Mic
+                    lv_obj_t *obj = lv_image_create(parent_obj);
+                    objects.mic = obj;
+                    lv_obj_set_pos(obj, 62, 4);
+                    lv_obj_set_size(obj, 100, 80);
+                    lv_image_set_src(obj, &img_microphone);
+                    lv_image_set_scale(obj, 128);
+                }
+            }
+        }
+        {
             // bottomContainer_3
             lv_obj_t *obj = lv_obj_create(parent_obj);
             objects.bottom_container_3 = obj;
@@ -1083,12 +1101,39 @@ void create_screen_agent() {
         }
     }
     
-    tick_screen_agent();
+    /* Always send AGENT_START when entering Agent screen */
+    ws_set_agent_mode(true);
+    if (ws_is_connected()) {
+        ws_send_text("AGENT_START");
+        ESP_LOGI("screens", "Agent screen entered - sending AGENT_START");
+    } else {
+        ESP_LOGW("screens", "Agent mode ON but not connected yet");
+    }
 }
 
 void tick_screen_agent() {
+    static bool s_was_chat_mode = false;
+    static bool s_last_connected = false;
     void *flowState = getFlowState(0, 4);
     (void)flowState;
+    
+    /* Check if we need to send AGENT_START when connected */
+    bool now_connected = ws_is_connected();
+    if (now_connected && !s_last_connected) {
+        /* Just connected - send AGENT_START */
+        ws_set_agent_mode(true);
+        ws_send_text("AGENT_START");
+        ESP_LOGI("screens", "Connected - sending AGENT_START");
+    }
+    s_last_connected = now_connected;
+    
+    /* Switch from Chat to Agent mode */
+    if (s_was_chat_mode) {
+        ws_set_agent_mode(true);
+        ws_send_text("AGENT_START");
+        s_was_chat_mode = false;
+        ESP_LOGI("screens", "Switched to Agent mode (ZeroClaw)");
+    }
 }
 
 void create_screen_smart_home() {

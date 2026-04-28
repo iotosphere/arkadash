@@ -24,7 +24,7 @@ static void init_lcd_spi(void)
         .miso_io_num     = -1,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
-        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2 + 4096,
+        .max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2,  // Smaller buffer to prevent SPI queue overflow
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 }
@@ -33,13 +33,14 @@ static void init_lcd_panel(void)
 {
     ESP_LOGI(TAG, "ST7789 panel init - CS:%d DC:%d RST:%d", TFT_CS, TFT_DC, TFT_RES);
 
+    // Let esp_lvgl_port handle the color trans done callback internally
     const esp_lcd_panel_io_spi_config_t io_config = {
         .dc_gpio_num         = TFT_DC,
         .cs_gpio_num         = TFT_CS,
-        .pclk_hz             = 20 * 1000 * 1000,
+        .pclk_hz             = 20 * 1000 * 1000,  // 20MHz - valid for ESP32-P4
         .spi_mode            = 0,
-        .trans_queue_depth   = 10,
-        .on_color_trans_done = NULL,
+        .trans_queue_depth   = 3,  // Reduced from 10 to prevent queue backup
+        .on_color_trans_done = NULL,  // esp_lvgl_port manages this
         .user_ctx            = NULL,
         .lcd_cmd_bits        = 8,
         .lcd_param_bits      = 8,

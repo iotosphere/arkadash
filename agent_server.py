@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 """
-Unified Voice Assistant Server for ESP32-P4
-============================================
-Chat Mode: MiniMax-M2.7 + Edge TTS
-Agent Mode: ZeroClaw Gateway + Edge TTS
-
+Voice Assistant Server for ESP32-P4
 STT -> LLM -> TTS Pipeline
-STT: whisper.cpp server (local) | LLM: MiniMax or ZeroClaw | TTS: Edge
+STT: whisper.cpp server | LLM: MiniMax-M2.7 | TTS: Edge
 
-Usage:
-    python voice_server.py                      # Chat mode (MiniMax)
-    USE_ZEROCLAW=true python voice_server.py   # Agent mode (ZeroClaw)
-
-Environment Variables:
-    MINIMAX_API_KEY      - MiniMax API key
-    MINIMAX_GROUP_ID     - MiniMax group ID
-    MINIMAX_API_KEY      - MiniMax API key (Chat mode)
-    MINIMAX_GROUP_ID     - MiniMax group ID (Chat mode)
-    GEMINI_API_KEY       - Google Gemini API key (alternative TTS)
-    TTS_BACKEND          - TTS backend: "edge" (default), "gemini", "google_cloud"
-    WHISPER_SERVER       - whisper.cpp server URL (default: http://localhost:8080)
-    ZEROCLAW_HOST        - ZeroClaw gateway host (default: localhost)
-    ZEROCLAW_PORT        - ZeroClaw gateway port (default: 42617)
-    ZEROCLAW_TOKEN       - ZeroClaw auth token
-    USE_ZEROCLAW         - "true" to use ZeroClaw as default (default: "false")
+FIX: Session history artık WebSocket object ID yerine client IP adresine
+     bağlıdır. ESP32 reconnect etse bile aynı IP'den geldiği için
+     konuşma geçmişi korunur.
 """
 
 import asyncio
@@ -37,28 +20,23 @@ import httpx
 import websockets
 from typing import AsyncGenerator
 
-# ─── Configuration ──────────────────────────────────────────────────────────────
+MINIMAX_API_KEY  = os.environ.get("MINIMAX_API_KEY", "")
+MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
-MINIMAX_API_KEY   = os.environ.get("MINIMAX_API_KEY", "")
-MINIMAX_GROUP_ID  = os.environ.get("MINIMAX_GROUP_ID", "")
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+TTS_BACKEND   = os.environ.get("TTS_BACKEND", "edge")
+WHISPER_SERVER = "http://localhost:8080"
 
-TTS_BACKEND       = os.environ.get("TTS_BACKEND", "edge")
-WHISPER_SERVER    = os.environ.get("WHISPER_SERVER", "http://localhost:8080")
+# ZeroClaw Gateway (opsiyonel)
+ZEROCLAW_HOST  = os.environ.get("ZEROCLAW_HOST", "localhost")
+ZEROCLAW_PORT  = int(os.environ.get("ZEROCLAW_PORT", "42617"))
+ZEROCLAW_TOKEN = os.environ.get("ZEROCLAW_TOKEN", "zc_4795d5f23d70f2e908e7afc1d08df9700487a33d26820b99dcd728805097669f")
+ZEROCLAW_WS_URL = f"ws://{ZEROCLAW_HOST}:{ZEROCLAW_PORT}/ws/chat?token={ZEROCLAW_TOKEN}"
+USE_ZEROCLAW   = os.environ.get("USE_ZEROCLAW", "false").lower() == "true"
 
-# ZeroClaw Gateway (Agent mode)
-ZEROCLAW_HOST     = os.environ.get("ZEROCLAW_HOST", "localhost")
-ZEROCLAW_PORT     = int(os.environ.get("ZEROCLAW_PORT", "42617"))
-ZEROCLAW_TOKEN    = os.environ.get("ZEROCLAW_TOKEN", "zc_4795d5f23d70f2e908e7afc1d08df9700487a33d26820b99dcd728805097669f")
-ZEROCLAW_WS_URL   = f"ws://{ZEROCLAW_HOST}:{ZEROCLAW_PORT}/ws/chat?token={ZEROCLAW_TOKEN}"
-USE_ZEROCLAW      = os.environ.get("USE_ZEROCLAW", "false").lower() == "true"
-
-# System prompt for MiniMax (Chat mode)
 SYSTEM_PROMPT = """Sen Turkce konusan yardimci bir sesli asistansin.
 SADECE Turkce cevap ver, asla baska dil kullanma.
 Kisa ve dogal cevaplar ver, 1-2 cumle yeterli."""
-
-# ─── Session Management ────────────────────────────────────────────────────────
 
 # FIX: session key = client IP (str), reconnect sonrası history korunur
 conversation_histories: dict[str, list] = {}
@@ -71,7 +49,6 @@ MAX_HISTORY_TURNS = 20  # kullanıcı + asistan mesaj sayısı
 # ─── STT ──────────────────────────────────────────────────────────────────────
 
 async def transcribe_audio(pcm_bytes: bytes) -> str:
-    """Convert PCM audio to text using whisper.cpp server."""
     try:
         samples = struct.unpack(f"<{len(pcm_bytes)//2}h", pcm_bytes)
         mono_samples = array.array('h', [
@@ -126,10 +103,10 @@ async def transcribe_audio(pcm_bytes: bytes) -> str:
         return ""
 
 
-# ─── ZeroClaw Client (Agent Mode) ──────────────────────────────────────────────
+# ─── ZeroClaw Client ─────────────────────────────────────────────────────────
 
 async def zeroclaw_chat_stream(user_text: str) -> AsyncGenerator[str, None]:
-    """ZeroClaw gateway'den streaming yanıt al (Agent mode)."""
+    """ZeroClaw gateway'den streaming yanit al."""
     try:
         print(f"[ZeroClaw] Streaming: '{user_text[:50]}...'")
         
@@ -183,7 +160,7 @@ async def chat_stream(session_id: str, user_text: str, use_zeroclaw: bool = Fals
                 history.pop()
         return
 
-    # MiniMax API kullan (Chat mode - düşük gecikme)
+    # MiniMax API kullan (Chat mode - düsük gecikme)
     url = f"https://api.minimax.io/v1/text/chatcompletion_v2?GroupId={MINIMAX_GROUP_ID}"
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
@@ -278,7 +255,7 @@ async def chat_stream(session_id: str, user_text: str, use_zeroclaw: bool = Fals
             history.pop()
 
 
-# ─── TTS Helpers ────────────────────────────────────────────────────────────────
+# ─── TTS Helpers ───────────────────────────────────────────────────────────────
 
 def clean_text_for_tts(text: str) -> str:
     """Remove emojis and problematic characters before TTS."""
@@ -306,18 +283,16 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-
-# ─── TTS ───────────────────────────────────────────────────────────────────────
+# ─── TTS ──────────────────────────────────────────────────────────────────────
 
 async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
-    """Edge TTS streaming (default TTS backend)."""
     try:
         import edge_tts
         import subprocess
 
         print(f"[TTS-Edge] Requesting: '{text[:50]}...'")
 
-        communicate = edge_tts.Communicate(text, voice="tr-TR-AhmetNeural", rate="-20%")
+        communicate = edge_tts.Communicate(text, voice="tr-TR-AhmetNeural")
         mp3_chunks = []
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -352,8 +327,8 @@ async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
             duration = len(pcm_data) / (16000 * 2 * 2)
             print(f"[TTS-Edge] PCM: {len(pcm_data)} bytes, {duration:.2f}s @ 16kHz stereo")
 
-            # Büyük chunk'lar - daha düzgün ses akışı için
-            chunk_size = 4096
+            # Küçük chunk'lar - ESP daha hızlı alır, TCP tamponı dolmaz
+            chunk_size = 1024
             for i in range(0, len(pcm_data), chunk_size):
                 yield pcm_data[i:i+chunk_size]
 
@@ -370,7 +345,6 @@ async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
 
 
 async def tts_gemini_stream(text: str) -> AsyncGenerator[bytes, None]:
-    """Gemini TTS streaming (alternative TTS backend)."""
     try:
         from google import genai
         from google.genai import types
@@ -404,7 +378,6 @@ async def tts_gemini_stream(text: str) -> AsyncGenerator[bytes, None]:
 
 
 async def tts_google_cloud_stream(text: str) -> AsyncGenerator[bytes, None]:
-    """Google Cloud TTS streaming (alternative TTS backend)."""
     try:
         import base64
         import numpy as np
@@ -436,7 +409,6 @@ async def tts_google_cloud_stream(text: str) -> AsyncGenerator[bytes, None]:
 
 
 async def tts_stream(text: str) -> AsyncGenerator[bytes, None]:
-    """Route TTS request to appropriate backend based on TTS_BACKEND env var."""
     if TTS_BACKEND == "edge":
         async for chunk in tts_edge_stream(text):
             yield chunk
@@ -522,36 +494,18 @@ async def process_audio(websocket, session_id: str, audio_buffer: bytearray, use
         active_pipelines.pop(session_id, None)
 
 
-# ─── WebSocket handler ─────────────────────────────────────────────────────────
+# ─── WebSocket handler ────────────────────────────────────────────────────────
 
 async def handle_client(websocket):
-    """Handle ESP32 client connection.
-    
-    Protocol:
-      - "CHAT_START" → Switch to MiniMax (Chat mode)
-      - "AGENT_START" → Switch to ZeroClaw (Agent mode)
-      - "PTT_START" → Start recording audio
-      - [4-byte size] → Audio size header
-      - [binary audio data] → Audio chunks
-      - "PTT_STOP" → Stop recording and process
-    
-    Responses:
-      - {"type": "transcript", "text": "..."} → STT result
-      - {"type": "status", "msg": "..."} → Processing status
-      - {"type": "tts_start"} → TTS playback begins
-      - [binary PCM chunks] → Audio data
-      - {"type": "tts_end", "size": N} → TTS playback ends
-      - {"type": "done"} → Pipeline complete
-    """
     # FIX: session_id = IP adresi. Reconnect sonrası aynı IP → aynı history.
     client_ip  = websocket.remote_address[0]
     session_id = client_ip
     print(f"[+] Client connected: {websocket.remote_address} (session={session_id})")
 
-    audio_buffer       = bytearray()
-    recording          = False
+    audio_buffer      = bytearray()
+    recording         = False
     expected_audio_len = 0
-    use_zeroclaw       = False  # Chat=False (MiniMax), Agent=True (ZeroClaw)
+    use_zeroclaw      = False  # Chat=False (MiniMax), Agent=True (ZeroClaw)
 
     try:
         async for message in websocket:
@@ -562,22 +516,21 @@ async def handle_client(websocket):
             if isinstance(message, str):
                 msg_stripped = message.strip()
 
-                # Mod değiştirme mesajları
+                # Mod degistirme mesajlari
                 if msg_stripped == "CHAT_START":
                     use_zeroclaw = False
-                    print("[*] Mode: Chat (MiniMax - düşük gecikme)")
+                    print("[*] Mode: Chat (MiniMax - düsük gecikme)")
                     continue
                 elif msg_stripped == "AGENT_START":
                     use_zeroclaw = True
                     print("[*] Mode: Agent (ZeroClaw - çok adımlı görevler)")
-                    continue
 
                 elif msg_stripped in ("PTT_START", "PTT_STAR", "PTT_STA"):
                     if session_id in active_pipelines:
                         print("[!] Pipeline already running, ignoring PTT_START")
                         continue
                     audio_buffer.clear()
-                    recording           = True
+                    recording          = True
                     expected_audio_len = 0
                     print(f"[*] Recording started (msg: {repr(message)})")
 
@@ -601,7 +554,7 @@ async def handle_client(websocket):
                         print("[!] Pipeline already running, ignoring PTT_START")
                         continue
                     audio_buffer.clear()
-                    recording           = True
+                    recording          = True
                     expected_audio_len = 0
                     print(f"[*] Recording started (bytes)")
 
@@ -636,34 +589,38 @@ async def handle_client(websocket):
               f"(history={len(conversation_histories.get(session_id, []))} msgs, preserved)")
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
-    """Start the unified voice server."""
-    
-    print("=" * 60)
-    print("  Unified Voice Assistant Server v3.0")
-    print("=" * 60)
-    
+    # ZeroClaw modu kullaniliyorsa MiniMax gerekli degil
     if USE_ZEROCLAW:
-        print("  Mode: Agent (ZeroClaw - multi-step tasks)")
+        print("=" * 60)
+        print("  Voice Assistant Server v2.3 (ZeroClaw Mode)")
+        print("=" * 60)
         print(f"  ZeroClaw: {ZEROCLAW_WS_URL[:50]}...")
+        print("  STT: whisper.cpp server (local)")
+        print(f"  TTS: {TTS_BACKEND}")
+        print("  Session: IP-based (reconnect-safe)")
+        print("  ws://0.0.0.0:8765")
+        print("=" * 60)
     else:
-        print("  Mode: Chat (MiniMax - low latency)")
         if not MINIMAX_API_KEY:
             print("ERROR: MINIMAX_API_KEY not set!"); return
         if not MINIMAX_GROUP_ID:
             print("ERROR: MINIMAX_GROUP_ID not set!"); return
-    
-    print(f"  TTS Backend: {TTS_BACKEND}")
-    print(f"  Whisper Server: {WHISPER_SERVER}")
-    print(f"  Session: IP-based (reconnect-safe)")
-    print("  WebSocket: ws://0.0.0.0:8765")
-    print("=" * 60)
-    
-    if TTS_BACKEND != "edge" and not GEMINI_API_KEY:
-        print(f"WARNING: GEMINI_API_KEY not set (required for TTS_BACKEND={TTS_BACKEND})")
-    
+        if TTS_BACKEND != "edge" and not GEMINI_API_KEY:
+            print(f"ERROR: GEMINI_API_KEY not set (required for TTS_BACKEND={TTS_BACKEND})!"); return
+
+        print("=" * 60)
+        print("  Voice Assistant Server v2.2 (MiniMax Mode)")
+        print("=" * 60)
+        print("  STT: whisper.cpp server (local)")
+        print("  LLM: MiniMax-M2.7")
+        print(f"  TTS: {TTS_BACKEND}")
+        print("  Session: IP-based (reconnect-safe)")
+        print("  ws://0.0.0.0:8765")
+        print("=" * 60)
+
     async with websockets.serve(handle_client, "0.0.0.0", 8765):
         await asyncio.Future()
 
