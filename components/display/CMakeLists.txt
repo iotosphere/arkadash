@@ -1,3 +1,3 @@
 idf_component_register(SRCS "display.c"
                     INCLUDE_DIRS "include"
-                    PRIV_REQUIRES app_config driver esp_lcd esp_driver_spi esp_lvgl_port lvgl esp_lcd_st7789)
+                    PRIV_REQUIRES app_config driver esp_lcd esp_driver_spi esp_driver_ledc esp_lvgl_port lvgl esp_lcd_st7789)

@@ -23,13 +23,25 @@ static const lv_img_dsc_t* weather_code_to_icon(int code)
 
 extern "C" {
 
-void ui_set_time(int hour, int minute, int second, int date, int month, int year, const char *day_name)
+void ui_set_time(int hour, int minute, int second, int date, const char *month_str, int year, const char *day_name)
 {
-    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_HOUR, Value(hour));
-    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_MINUTE, Value(minute));
-    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_SECOND, Value(second));
-    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_DATE, Value(date));
-    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_MONTH, Value(month));
+    static char hour_str[3];
+    static char minute_str[3];
+    static char second_str[3];
+    static char date_str[3];
+
+    snprintf(hour_str, sizeof(hour_str), "%02d", hour);
+    snprintf(minute_str, sizeof(minute_str), "%02d", minute);
+    snprintf(second_str, sizeof(second_str), "%02d", second);
+    snprintf(date_str, sizeof(date_str), "%02d", date);
+
+    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_HOUR, Value(hour_str));
+    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_MINUTE, Value(minute_str));
+    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_SECOND, Value(second_str));
+    flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_DATE, Value(date_str));
+    if (month_str) {
+        flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_MONTH, Value(month_str));
+    }
     flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_YEAR, Value(year));
     if (day_name) {
         flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_DAY_NAME, Value(day_name));
@@ -79,6 +91,113 @@ void ui_set_weather_icon(int weather_code)
         lv_image_set_src(objects.weather_icon, icon);
         printf("  -> Set icon OK\n");
     }
+}
+
+/* -----------------------------------------------------------------------
+ * Battery status → icon mapping.
+ *
+ * Image set (per asset names in EEZ):
+ *   img_charging        → %20  red  (mis-named; intended as low-battery)
+ *   img_50              → %50  yellow
+ *   img_80              → %80  green
+ *   img_full_battery    → %100 green
+ *   img_high_battery    → %80  green (alias)
+ *   img_plus            → charging overlay (bolt + plus)
+ * ----------------------------------------------------------------------- */
+static const lv_img_dsc_t* pick_battery_icon(int pct, bool charging)
+{
+    if (charging) return &img_plus;          /* charging takes priority */
+    if (pct < 20)  return &img_charging;     /* red low */
+    if (pct < 50)  return &img_50;           /* yellow */
+    if (pct < 80)  return &img_80;           /* green mid */
+    return &img_full_battery;                /* green full */
+}
+
+void ui_set_battery_state(int percent, bool charging)
+{
+    if (percent < 0)   percent = 0;
+    if (percent > 100) percent = 100;
+
+    printf("ui_set_battery_state: pct=%d charging=%d\n", percent, charging);
+
+    const lv_img_dsc_t *icon = pick_battery_icon(percent, charging);
+
+    /* main screen battery_1 is the only image object that carries the
+     * battery glyph across the top-bar variants; mirror it everywhere we
+     * can find one so the icon stays consistent regardless of screen. */
+    if (objects.battery_1) {
+        lv_image_set_src(objects.battery_1, icon);
+        printf("  -> Set battery_1 OK (%s)\n", charging ? "plus" :
+               percent < 20 ? "charging-as-low" :
+               percent < 50 ? "50" :
+               percent < 80 ? "80" : "full");
+    }
+    if (objects.battery) {
+        lv_image_set_src(objects.battery, icon);
+    }
+}
+
+void ui_set_footer(const char *text)
+{
+    printf("ui_set_footer: text=%s\n", text ? text : "(null)");
+    
+    // Update header label on assistant screen
+    if (objects.obj4) {
+        lv_label_set_text(objects.obj4, text);
+    }
+    
+    // Update all author (footer) labels
+    if (objects.author && text) {
+        lv_label_set_text(objects.author, text);
+    }
+    if (objects.author_1 && text) {
+        lv_label_set_text(objects.author_1, text);
+    }
+    if (objects.author_2 && text) {
+        lv_label_set_text(objects.author_2, text);
+    }
+    if (objects.author_3 && text) {
+        lv_label_set_text(objects.author_3, text);
+    }
+    if (objects.author_4 && text) {
+        lv_label_set_text(objects.author_4, text);
+    }
+    if (objects.author_5 && text) {
+        lv_label_set_text(objects.author_5, text);
+    }
+    if (objects.author_6 && text) {
+        lv_label_set_text(objects.author_6, text);
+    }
+    if (objects.author_7 && text) {
+        lv_label_set_text(objects.author_7, text);
+    }
+}
+
+/* Settings page sliders — called from main.c when the user moves
+ * volume / brightness. They in turn route into the existing audio
+ * and display backlight APIs. */
+void ui_set_volume(int pct)
+{
+    if (!objects.volume) return;
+    /* Clamp to slider's configured range (0..100). */
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    lv_slider_set_value(objects.volume, pct, LV_ANIM_OFF);
+    /* Forward to audio_set_volume(). main.c's settings_volume_cb also
+     * calls this directly, so this is the single point of truth. */
+    extern void audio_set_volume(int pct);
+    audio_set_volume(pct);
+}
+
+void ui_set_brightness(int pct)
+{
+    if (!objects.brightness) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    lv_slider_set_value(objects.brightness, pct, LV_ANIM_OFF);
+    /* Forward to display backlight PWM. */
+    extern void display_backlight_set(uint8_t pct);
+    display_backlight_set((uint8_t)pct);
 }
 
 }

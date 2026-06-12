@@ -4,6 +4,7 @@
 #include <esp_log.h>
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
+#include <driver/ledc.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -111,4 +112,14 @@ void display_backlight_on(void)
 {
     gpio_set_level(TFT_BLK, LCD_BK_LIGHT_ON_LEVEL);
     ESP_LOGI(TAG, "Backlight ON");
+}
+
+void display_backlight_set(uint8_t pct)
+{
+    if (pct > 100) pct = 100;
+    /* LEDC duty resolution is 8-bit (configured in display_init's
+     * ledc_timer_config), so map 0..100% -> 0..255. */
+    uint32_t duty = (255 * (uint32_t)pct) / 100;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }

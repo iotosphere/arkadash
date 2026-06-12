@@ -1,6 +1,6 @@
 #include "images.h"
 
-const ext_img_desc_t images[33] = {
+const ext_img_desc_t images[45] = {
     { "wifi", &img_wifi },
     { "agent", &img_agent },
     { "settings", &img_settings },
@@ -34,4 +34,16 @@ const ext_img_desc_t images[33] = {
     { "microphone", &img_microphone },
     { "record-button", &img_record_button },
     { "infopic", &img_infopic },
+    { "music", &img_music },
+    { "play", &img_play },
+    { "pause", &img_pause },
+    { "next", &img_next },
+    { "prev", &img_prev },
+    { "notes", &img_notes },
+    { "playlist", &img_playlist },
+    { "living", &img_living },
+    { "kitchen", &img_kitchen },
+    { "temperature", &img_temperature },
+    { "thread", &img_thread },
+    { "matter", &img_matter },
 };

@@ -40,6 +40,18 @@ extern const lv_img_dsc_t img_ai_asistant;
 extern const lv_img_dsc_t img_microphone;
 extern const lv_img_dsc_t img_record_button;
 extern const lv_img_dsc_t img_infopic;
+extern const lv_img_dsc_t img_music;
+extern const lv_img_dsc_t img_play;
+extern const lv_img_dsc_t img_pause;
+extern const lv_img_dsc_t img_next;
+extern const lv_img_dsc_t img_prev;
+extern const lv_img_dsc_t img_notes;
+extern const lv_img_dsc_t img_playlist;
+extern const lv_img_dsc_t img_living;
+extern const lv_img_dsc_t img_kitchen;
+extern const lv_img_dsc_t img_temperature;
+extern const lv_img_dsc_t img_thread;
+extern const lv_img_dsc_t img_matter;
 
 #ifndef EXT_IMG_DESC_T
 #define EXT_IMG_DESC_T
@@ -49,7 +61,7 @@ typedef struct _ext_img_desc_t {
 } ext_img_desc_t;
 #endif
 
-extern const ext_img_desc_t images[33];
+extern const ext_img_desc_t images[45];
 
 #ifdef __cplusplus
 }

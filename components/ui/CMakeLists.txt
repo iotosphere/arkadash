@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
-        "ui.c"
         "screens.c"
+        "ui.c"
         "styles.c"
         "images.c"
         "eez-flow.cpp"
@@ -23,9 +23,14 @@ idf_component_register(
         "ui_image_high_battery.c"
         "ui_image_hum.c"
         "ui_image_info.c"
+        "ui_image_music.c"
         "ui_image_microphone.c"
         "ui_image_night.c"
         "ui_image_night__1_.c"
+        "ui_image_notes.c"
+        "ui_image_pause.c"
+        "ui_image_play.c"
+        "ui_image_playlist.c"
         "ui_image_plus.c"
         "ui_image_rainy.c"
         "ui_image_rainy__1_.c"
@@ -39,6 +44,14 @@ idf_component_register(
         "ui_image_umbrella.c"
         "ui_image_wifi.c"
         "ui_image_infopic.c"
+        "ui_image_next.c"
+        "ui_image_prev.c"
+        "ui_image_living.c"
+        "ui_image_kitchen.c"
+        "ui_image_temperature.c"
+        "ui_image_thread.c"
+        "ui_image_matter.c"
     INCLUDE_DIRS "." "include"
+    REQUIRES esp_lvgl_port
     PRIV_REQUIRES lvgl esp_lvgl_port display encoder freertos esp_timer games
 )
