@@ -24,10 +24,10 @@
 #define LCD_HOST                 SPI2_HOST
 #define LCD_BK_LIGHT_ON_LEVEL   1
 
-/* Audio (future use) */
+/* Audio - 16kHz (MCLK 512x for stability) */
 #define EXAMPLE_RECV_BUF_SIZE   (2400)
 #define EXAMPLE_SAMPLE_RATE     (16000)
-#define EXAMPLE_MCLK_MULTIPLE   (384)
+#define EXAMPLE_MCLK_MULTIPLE   (512)
 #define EXAMPLE_MCLK_FREQ_HZ    (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
 #define EXAMPLE_VOICE_VOLUME    80
 #define RECORD_BUFFER_SIZE      (16000 * 2 * 5)
@@ -46,3 +46,8 @@
 #define I2C_NUM                 (0)
 #define I2C_SCL_IO              (8)
 #define I2C_SDA_IO              (7)
+/* Battery Voltage Sensing
+ * Note: ESP32-P4 ADC GPIOs are 16-23 (ADC1) and 49-54 (ADC2).
+ * Original schematic wired to GPIO 48 which has no ADC function on P4,
+ * so we moved the divider tap to GPIO 50 (ADC2_CH1). */
+#define BATTERY_ADC_PIN         (50)

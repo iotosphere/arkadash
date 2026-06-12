@@ -1,5 +1,6 @@
 #include "clock_weather.h"
-#include "ui.h"
+#include "../ui/include/ui.h"
+#include "battery_monitor.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -40,10 +41,20 @@ static const char *weather_code_to_str(int code)
 static const char *day_name_tr(int wday)
 {
     static const char *names[] = {
-        "Pazar", "Pazartesi", "Sali", "Carsamba",
-        "Persembe", "Cuma", "Cumartesi"
+        "Paz", "Pzt", "Sal", "Car",
+        "Per", "Cum", "Cts"
     };
     if (wday >= 0 && wday <= 6) return names[wday];
+    return "?";
+}
+
+static const char *month_name_tr(int month)
+{
+    static const char *names[] = {
+        "Oca", "Sub", "Mar", "Nis", "May", "Haz",
+        "Tem", "Agu", "Eyl", "Eki", "Kas", "Ara"
+    };
+    if (month >= 1 && month <= 12) return names[month - 1];
     return "?";
 }
 
@@ -97,7 +108,7 @@ static void clock_task(void *pv)
 
         if (lvgl_port_lock(pdMS_TO_TICKS(100))) {
             ui_set_time(t.tm_hour, t.tm_min, t.tm_sec,
-                        t.tm_mday, t.tm_mon + 1, t.tm_year + 1900,
+                        t.tm_mday, month_name_tr(t.tm_mon + 1), (t.tm_year + 1900) % 100,
                         day_name_tr(t.tm_wday));
             lvgl_port_unlock();
         } else {
@@ -243,6 +254,32 @@ static void weather_task(void *pv)
     }
 }
 
+/* ── Battery ──────────────────────────────────────────────────────── */
+
+static void battery_task(void *pv)
+{
+    (void)pv;
+    const TickType_t period = pdMS_TO_TICKS(30000);  /* 30 s */
+    TickType_t last = xTaskGetTickCount();
+
+    /* First read after 2 s so EEZ is fully up. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    for (;;) {
+        uint8_t pct = 0;
+        bool charging = false;
+        battery_monitor_read(&pct, &charging);
+
+        /* Touch LVGL objects — must hold the port lock. */
+        if (lvgl_port_lock(0)) {
+            ui_set_battery_state((int)pct, charging);
+            lvgl_port_unlock();
+        }
+
+        vTaskDelayUntil(&last, period);
+    }
+}
+
 /* ── Init ─────────────────────────────────────────────────────────── */
 
 esp_err_t clock_weather_init(void)
@@ -251,8 +288,11 @@ esp_err_t clock_weather_init(void)
 
     init_sntp();
 
-    xTaskCreatePinnedToCore(clock_task, "clock_task", 4096, NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(weather_task, "weather_task", 8192, NULL, 3, NULL, 1);
+    battery_monitor_init();
+
+    xTaskCreatePinnedToCore(clock_task,    "clock_task",    4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(weather_task,  "weather_task",  8192, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(battery_task,  "battery_task",  4096, NULL, 2, NULL, 1);
 
     ESP_LOGI(TAG, "Clock + Weather tasks started");
     return ESP_OK;

@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 
 static const char *TAG = "ws_client";
 
@@ -15,10 +16,11 @@ static bool s_connected = false;
 
 static bool   s_waiting_for_response = false;
 static bool   s_tts_complete         = false;
+static bool   s_has_error            = false;  /* server error aldık, ring buffer invalid */
 static size_t s_expected_size        = 0;
 static bool   s_agent_mode           = false;  /* Chat=false (MiniMax), Agent=true (ZeroClaw) */
 
-/* 64 KB statik ring buffer */
+/* 64 KB statik ring buffer - TTS PCM verisi için */
 static uint8_t           s_rb_storage[65536];
 static StaticRingbuffer_t s_rb_struct;
 static RingbufHandle_t    s_rb_handle = NULL;
@@ -28,6 +30,7 @@ static RingbufHandle_t    s_rb_handle = NULL;
 void ws_set_waiting(bool waiting)      { s_waiting_for_response = waiting; }
 void ws_set_tts_complete(bool complete){ s_tts_complete = complete; }
 bool ws_is_tts_complete(void)          { return s_tts_complete; }
+bool ws_has_error(void)                { return s_has_error; }
 uint8_t *ws_get_response_buf(void)     { return NULL; }
 size_t   ws_get_response_len(void)     { return 0; }
 size_t   ws_get_expected_size(void)    { return s_expected_size; }
@@ -50,6 +53,7 @@ void ws_clear_response(void)
 {
     s_expected_size = 0;
     s_tts_complete  = false;
+    s_has_error     = false;
     drain_ring_buffer();
 }
 
@@ -58,6 +62,13 @@ void ws_stream_clear(void) { drain_ring_buffer(); }
 size_t ws_stream_read(uint8_t *buf, size_t len, uint32_t timeout_ms)
 {
     if (!s_rb_handle || !buf || len == 0) return 0;
+
+    /* Error state'da ring buffer invalid — boşalt ve dön */
+    if (s_has_error) {
+        drain_ring_buffer();
+        return 0;
+    }
+
     size_t   item_size = 0;
     uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
         s_rb_handle, &item_size, pdMS_TO_TICKS(timeout_ms), len);
@@ -128,9 +139,31 @@ static void websocket_event_handler(void *handler_args,
                 /* s_waiting_for_response'u burada sıfırlama —
                    binary chunk'lar hâlâ gelebilir. chat_task sıfırlar. */
             }
-            else if (strstr(json_buf, "error")) {
-                ESP_LOGW(TAG, "Server error");
+            else if (strstr(json_buf, "done")) {
+                /* Tüm veri akışı tamamlandı - ring buffer boşalana kadar bekle */
+                ESP_LOGI(TAG, "done - all data sent");
+                s_tts_complete = true;
+            }
+else if (strstr(json_buf, "error")) {
+                ESP_LOGW(TAG, "Server error - invalidating ring buffer");
                 s_waiting_for_response = false;
+                s_has_error = true;
+                drain_ring_buffer();
+            }
+else if (strstr(json_buf, "spotify_playlists")) {
+                ESP_LOGI(TAG, "spotify_playlists received");
+                extern void ui_spotify_update_playlists(const char *json);
+                ui_spotify_update_playlists(json_buf);
+            }
+            else if (strstr(json_buf, "spotify_status")) {
+                ESP_LOGI(TAG, "spotify_status received");
+                extern void ui_spotify_update_status(const char *json);
+                ui_spotify_update_status(json_buf);
+            }
+            else if (strstr(json_buf, "\"type\":\"spotify_status\"")) {
+                ESP_LOGI(TAG, "spotify_status received: %s", json_buf);
+                extern void ui_spotify_update_status(const char *json);
+                ui_spotify_update_status(json_buf);
             }
             free(json_buf);
 
@@ -312,4 +345,88 @@ void ws_set_agent_mode(bool agent_mode)
 bool ws_is_agent_mode(void)
 {
     return s_agent_mode;
+}
+
+/* ── Spotify Control ──────────────────────────────────────────── */
+
+esp_err_t ws_send_spotify_list(void)
+{
+    return ws_send_text("SPOTIFY_LIST");
+}
+
+esp_err_t ws_send_spotify_play(const char *playlist_id)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "SPOTIFY_PLAY:%s", playlist_id);
+    return ws_send_text(cmd);
+}
+
+esp_err_t ws_send_spotify_status(void)
+{
+    return ws_send_text("SPOTIFY_STATUS");
+}
+
+static void spotify_status_timer_callback(void *arg) {
+    ws_send_text("SPOTIFY_STATUS");
+}
+
+esp_err_t ws_send_spotify_status_delayed(void)
+{
+    static esp_timer_handle_t status_timer = NULL;
+    if (!status_timer) {
+        esp_timer_create_args_t args = {
+            .callback = spotify_status_timer_callback,
+            .arg = NULL,
+            .name = "spotify_status_timer"
+        };
+        esp_timer_create(&args, &status_timer);
+    }
+    esp_timer_start_once(status_timer, 500000);
+    return ESP_OK;
+}
+
+esp_err_t ws_send_spotify_pause(void)
+{
+    return ws_send_text("SPOTIFY_PAUSE");
+}
+
+esp_err_t ws_send_spotify_resume(void)
+{
+    return ws_send_text("SPOTIFY_RESUME");
+}
+
+esp_err_t ws_send_spotify_skip(void)
+{
+    return ws_send_text("SPOTIFY_SKIP");
+}
+
+esp_err_t ws_send_spotify_toggle(void)
+{
+    return ws_send_text("SPOTIFY_TOGGLE");
+}
+
+/* ── LED Control ──────────────────────────────────────────── */
+
+esp_err_t ws_send_led_toggle(void)
+{
+    return ws_send_text("LED_TOGGLE");
+}
+
+esp_err_t ws_send_led_color(int color_x, int color_y)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "LED_COLOR:%d:%d", color_x, color_y);
+    return ws_send_text(cmd);
+}
+
+esp_err_t ws_send_led_brightness(int level)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "LED_BRIGHTNESS:%d", level);
+    return ws_send_text(cmd);
+}
+
+esp_err_t ws_send_led_status(void)
+{
+    return ws_send_text("LED_STATUS");
 }
