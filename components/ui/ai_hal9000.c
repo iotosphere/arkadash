@@ -61,7 +61,7 @@ void ai_hal9000_create(lv_obj_t *parent) {
         return;
     }
 
-    /* === Container — 110x110, başta gizli === */
+    /* === Container — 110x110, her zaman görünür (AI sussa bile HAL 9000 gözü ekranda) === */
     hal_container = lv_obj_create(parent);
     lv_obj_set_size(hal_container, HAL_SIZE, HAL_SIZE);
     lv_obj_remove_style_all(hal_container);
@@ -69,12 +69,16 @@ void ai_hal9000_create(lv_obj_t *parent) {
     lv_obj_set_style_border_width(hal_container, 0, 0);
     lv_obj_clear_flag(hal_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_align(hal_container, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(hal_container, LV_OBJ_FLAG_HIDDEN);
+    /* HIDDEN YOK — göz her zaman görünür, sadece animasyon pause/resume olur */
 
     /* === HAL 9000 GIF widget ===
      * lv_gif_set_src: raw GIF byte array'i verir, decoder otomatik çözer ve
      * internal timer (10ms) ile frame'leri sırayla gösterir.
      * 76 frame × ~30ms = 2.3s tam döngü, INFINITE loop.
+     *
+     * Başlangıç durumu: PAUSE edilir (constructor + gif_initialize otomatik
+     * resume ediyor). Frame 0'da donuk kalır — kullanıcı "HAL 9000 hareketsiz
+     * dursun" istedi. AI konuşmaya başlayınca start() içinde resume edilir.
      *
      * lv_obj_set_size: widget 108x108 (1px margin hal_container içinde).
      * STRETCH alignment gerekmez — GIF widget image davranışı kalıtım alır,
@@ -84,9 +88,13 @@ void ai_hal9000_create(lv_obj_t *parent) {
     lv_obj_set_size(hal_gif, 108, 108);
     lv_gif_set_src(hal_gif, &hal9000_gif);
     lv_obj_center(hal_gif);
+    /* GIF timer otomatik resume olmuştu (gif_initialize). Frame 0'a dön ve
+     * durdur — göz "bekleme" durumunda statik görünsün. */
+    lv_gif_restart(hal_gif);
+    lv_gif_pause(hal_gif);
 
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "HAL 9000 oluşturuldu (GIF 76 frame, 2.3s döngü, PSRAM draw_buf)");
+    ESP_LOGI(TAG, "HAL 9000 oluşturuldu (GIF paused @ frame 0, AI konuşunca resume)");
 }
 
 void ai_hal9000_start(void) {
@@ -104,11 +112,12 @@ void ai_hal9000_start(void) {
     }
 
     is_active = true;
-    lv_obj_clear_flag(hal_container, LV_OBJ_FLAG_HIDDEN);
-    /* GIF timer otomatik çalışıyor (constructor'da resume edildi), restart etmeye gerek yok */
+    /* Container her zaman görünür — sadece GIF timer'ı resume et */
+    lv_gif_restart(hal_gif);  /* önceki konuşmadan kalan yerden değil, baştan başla */
+    lv_gif_resume(hal_gif);
 
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "HAL 9000 görünür + GIF otomatik animasyon (AI konuşuyor)");
+    ESP_LOGI(TAG, "HAL 9000 animasyon başladı (AI konuşuyor)");
 }
 
 void ai_hal9000_stop(void) {
@@ -122,15 +131,12 @@ void ai_hal9000_stop(void) {
         return;
     }
 
-    if (hal_container) {
-        lv_obj_add_flag(hal_container, LV_OBJ_FLAG_HIDDEN);
-    }
-    /* GIF timer arka planda çalışmaya devam eder ama hidden widget render edilmez
-     * → display_task iş yükü yok, watchdog riski yok.
-     * İsterseniz ileride lv_timer_pause(hal_gif->timer) eklenebilir. */
+    /* GIF'i durdur ve frame 0'a sıfırla — göz yine "bekleme" durumuna dönsün */
+    lv_gif_pause(hal_gif);
+    lv_gif_restart(hal_gif);
 
     lvgl_port_unlock();
-    ESP_LOGI(TAG, "HAL 9000 gizli (AI sustu, GIF timer arka planda)");
+    ESP_LOGI(TAG, "HAL 9000 durdu (AI sustu, frame 0'da donuk)");
 }
 
 bool ai_hal9000_is_active(void) {
