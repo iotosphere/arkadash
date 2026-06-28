@@ -1,2 +1,18 @@
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ESP-Hosted SDIO queue boyutlarını küçült (internal RAM tasarrufu).
+# Backup restore sonrası sdkconfig'ten silinmişti, watchdog fix için geri eklendi.
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=10
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=10
+
+# LVGL: builtin malloc yerine custom allocator kullan (PSRAM'e yönlendir).
+# Default builtin 64 KB internal RAM TLSF, HAL 9000 widget'ları + animasyonlar
+# fragmentation yapıp insert_free_block merge recursion 5+ sn sürüyor (watchdog).
+# Custom malloc: main.c'de lv_malloc_core/free_core/realloc_core tanımlı,
+# heap_caps_malloc/free/realloc ile PSRAM (32 MB) üzerinden allocate ediyor.
+CONFIG_LV_USE_CUSTOM_MALLOC=y
+
+# LVGL draw buffer refresh period: 50ms (20 FPS) — HAL 9000 animasyonu için yeterli,
+# daha az CPU yükü, watchdog'a karşı tolerans. (Asıl isim LV_DEF_REFR_PERIOD.)
+CONFIG_LV_DEF_REFR_PERIOD=50

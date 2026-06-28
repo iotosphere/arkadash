@@ -13,7 +13,85 @@
 #include "lvgl.h"
 #include "nvs_flash.h"
 #include "screens.h"
+#include "ai_hal9000.h"
 #include "ui.h"
+
+/* ============================================================================
+ * LVGL PSRAM custom allocator (lv_malloc_core / lv_free_core / lv_realloc_core)
+ *
+ * CONFIG_LV_USE_CUSTOM_MALLOC=y olduğunda LVGL kendi malloc/free/realloc
+ * implementasyonu derlemez; bu fonksiyonları projeden bekler. Burada hepsini
+ * heap_caps_malloc/free/realloc üzerinden PSRAM'e yönlendiriyoruz.
+ *
+ * Neden: default builtin malloc 64 KB internal RAM TLSF havuzu kullanır.
+ * HAL 9000 widget'ları + EEZ Flow ekranları + animasyonlar fragment edip
+ * insert_free_block merge recursion'ı 5+ sn sürüyor, watchdog ateşleniyordu.
+ * PSRAM 32 MB — fragmentation imkânsız, draw_buf için yer bol.
+ *
+ * Trade-off: PSRAM internal RAM'den yavaş (50-80 ns vs 10 ns), ama heap_caps_malloc
+ * fast path'inde kalındığı sürece overhead ihmal edilebilir (~%1-2 CPU).
+ * ============================================================================ */
+#include <stdlib.h>
+#include "esp_heap_caps.h"
+/* lv_mem.h LVGL internal path'inde, public API lvgl.h üzerinden expose.
+ * (lvgl.h zaten lv_mem.h'ı internal include ediyor.) */
+
+void lv_mem_init(void) {
+    /* Nothing to init — heap_caps handles PSRAM heap */
+}
+
+void lv_mem_deinit(void) {
+    /* Nothing to deinit */
+}
+
+void *lv_malloc_core(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+void *lv_realloc_core(void *p, size_t new_size) {
+    return heap_caps_realloc(p, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+void lv_free_core(void *p) {
+    heap_caps_free(p);
+}
+
+lv_mem_pool_t lv_mem_add_pool(void *mem, size_t bytes) {
+    /* Custom mode: pool management not supported */
+    LV_UNUSED(mem);
+    LV_UNUSED(bytes);
+    return NULL;
+}
+
+void lv_mem_remove_pool(lv_mem_pool_t pool) {
+    LV_UNUSED(pool);
+}
+
+void lv_mem_monitor_core(lv_mem_monitor_t *mon_p) {
+    /* heap_caps_get_minimum_free_size ile PSRAM izleme — fragmentation rapor edilmez
+     * (PSRAM ayrı heap, LVGL'nin internal allocator görmüyor). Yaklaşık değerler. */
+    if (!mon_p) return;
+    mon_p->total_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    mon_p->free_size  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    mon_p->free_biggest_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    mon_p->used_cnt = 0;
+    mon_p->free_cnt = 0;
+    mon_p->max_used = 0;
+    mon_p->used_pct = (mon_p->total_size > 0)
+        ? (uint8_t)((mon_p->total_size - mon_p->free_size) * 100 / mon_p->total_size)
+        : 0;
+    mon_p->frag_pct = 0;  /* heap_caps fragmentation bilinmiyor */
+}
+
+lv_result_t lv_mem_test_core(void) {
+    /* Basit sanity: küçük bir block allocate edip free et. */
+    void *p = heap_caps_malloc(64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) return LV_RESULT_INVALID;
+    heap_caps_free(p);
+    return LV_RESULT_OK;
+}
+
+/* ============================================================================ */
 #include "websocket_client.h"
 #include "wifi_station.h"
 #include <stdio.h>
@@ -25,7 +103,7 @@ static const char *TAG = "app_main";
 #define LONG_PRESS_MS 800u
 #define SLEEP_TIMEOUT_MS 90000u /* 1.5 dk */
 #define REC_BUF_SIZE (16000 * 2 * 5)
-#define VOICE_SERVER_URI "ws://192.168.1.8:8765"
+#define VOICE_SERVER_URI "ws://192.168.1.19:8765"
 
 static bool is_recording = false;
 static bool is_ai_speaking = false;
@@ -36,7 +114,11 @@ static bool push_handled = false;
 static bool menu_just_loaded = false;
 static bool long_press_triggered = false;
 static bool pending_menu_load = false;
+static bool pending_settings_load = false;
 static uint32_t push_start_ms = 0;
+static bool last_pushed_dbg = false; /* DEBUG: encoder PUSH edge tracker */
+static lv_obj_t *settings_base_obj =
+    NULL; /* invisible 4th focus item for base mode */
 static uint32_t game_just_stopped_ms = 0;
 static bool display_sleeping = false;
 static uint32_t last_activity_tick = 0;
@@ -44,6 +126,11 @@ static bool wake_up_just_happened = false;
 
 static lv_group_t *group_menu = NULL;
 static lv_group_t *group_smart_home = NULL;
+static lv_group_t *group_settings = NULL;
+static lv_group_t *group_assistant = NULL;
+static lv_group_t *group_music = NULL;
+static lv_group_t *group_games = NULL;
+static lv_group_t *group_info = NULL;
 static lv_indev_t *encoder_indev = NULL;
 
 /* stub - kitt anim was used for AI voice animation */
@@ -63,25 +150,8 @@ static void activity_reset(void) {
 
 /* ----------------------------------------------------------------------- */
 
-static void smart_home_living_room_cb(lv_event_t *e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    extern void ws_send_led_toggle(void);
-    ws_send_led_toggle();
-    ESP_LOGI(TAG, "Living Room LED toggle");
-  }
-}
-
-static void smart_home_kitchen_cb(lv_event_t *e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    ESP_LOGI(TAG, "Kitchen pressed");
-  }
-}
-
-static void smart_home_temperature_cb(lv_event_t *e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    ESP_LOGI(TAG, "Temperature pressed");
-  }
-}
+/* Smart Home buton callback'leri screens.c:200+'da tanımlı (LVGL generated).
+ * Çift kayıt YAPMA — yoksa buton click 2 kez tetiklenir (PR+CLICKED). */
 
 /* o-provision screen: button on settings page triggers this. */
 static void settings_provision_cb(lv_event_t *e) {
@@ -95,8 +165,10 @@ static void settings_provision_cb(lv_event_t *e) {
 
 /* Settings: live-update audio volume from the slider. */
 static void settings_volume_cb(lv_event_t *e) {
-  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-  if (!objects.volume) return;
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+    return;
+  if (!objects.volume)
+    return;
   int pct = lv_slider_get_value(objects.volume);
   extern void ui_set_volume(int pct);
   ui_set_volume(pct);
@@ -104,8 +176,10 @@ static void settings_volume_cb(lv_event_t *e) {
 
 /* Settings: live-update display backlight from the slider. */
 static void settings_brightness_cb(lv_event_t *e) {
-  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-  if (!objects.brightness) return;
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED)
+    return;
+  if (!objects.brightness)
+    return;
   int pct = lv_slider_get_value(objects.brightness);
   extern void ui_set_brightness(int pct);
   ui_set_brightness(pct);
@@ -133,7 +207,8 @@ static void chat_task(void *pv) {
   void *rx = audio_get_rx_handle();
   void *tx = audio_get_tx_handle();
 
-  s_rec_buf = heap_caps_malloc(REC_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+  s_rec_buf =
+      heap_caps_malloc(REC_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
   if (!s_rec_buf) {
     ESP_LOGE(TAG, "No mem");
     vTaskDelete(NULL);
@@ -382,6 +457,15 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
   bool pushed = encoder_button_pressed();
   lv_obj_t *cur = lv_scr_act();
 
+  /* DEBUG: log every PUSH edge so we can confirm the encoder button
+   * is actually toggling when the user presses it. */
+  if (pushed != last_pushed_dbg) {
+    ESP_LOGI("enc", "PUSH %s (cur=%p sleep=%d)",
+             pushed ? "PRESS" : "RELEASE", (void *)cur,
+             display_sleeping ? 1 : 0);
+    last_pushed_dbg = pushed;
+  }
+
   /* Ekran uyku modundayken encoder veya push ile uyandır */
   if (display_sleeping) {
     int32_t enc_diff = encoder_get_diff();
@@ -393,14 +477,13 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
       push_handled = false;
       data->enc_diff = 0;
       data->state = LV_INDEV_STATE_REL;
-      /* Uyandıktan sonra menu ekranına git */
-      lv_scr_load(objects.menu);
-      ui_set_footer("Menu");
-      lv_indev_set_group(encoder_indev, group_menu);
-      if (objects.asistant_button)
-        lv_group_focus_obj(objects.asistant_button);
+      /* Uyandıktan sonra ambient (main) ekranına dön — tıpkı boot gibi.
+       * Main ekranında interaktif widget yok; kullanıcı push yaparsa
+       * display_task'taki cur==main handler'ı menu'yü açar. */
+      lv_scr_load(objects.main);
+      ui_set_footer("Serhat SADAY");
+      lv_indev_set_group(encoder_indev, NULL);
       encoder_reset_count();
-      menu_just_loaded = true;
       return;
     }
     /* Uyku modundayken encoder verisi gönderme */
@@ -419,14 +502,33 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     push_handled = false;
   }
 
+  /* Note: there used to be a "swallow if push_handled" guard here that
+   * blocked per-page long-press handlers from running on hold ticks.
+   * We now rely on every page-specific block (settings / smart_home /
+   * assistant / prov / games) and the "other screens" fallback (which
+   * catches info / music / about / splash / main) to manage their own
+   * 800ms LONG_PRESS -> menu logic. With every block sending state=PR
+   * (not REL) on the hold ticks, LVGL's keypad.last_state stays
+   * PRESSED and click events still complete correctly. */
+
   if (!display_sleeping) {
     int32_t diff = encoder_get_diff();
     if (diff != 0 || pushed)
       last_activity_tick = lv_tick_get();
-    if (cur == objects.games)
+    if (cur == objects.games) {
       data->enc_diff = 0;
-    else
+    } else {
+      /* Encoder bounce / hardware gürültü koruması: 20ms içinde yeni event gelirse
+       * enc_diff'i tek adıma sınırla (yoksa LVGL grup sürekli cycle eder). */
+      static uint32_t last_enc_event_ms = 0;
+      uint32_t now = lv_tick_get();
+      if (diff != 0 && last_enc_event_ms != 0 &&
+          (now - last_enc_event_ms) < 20) {
+        diff = (diff > 0) ? 1 : -1;  /* clamp to single step */
+      }
+      if (diff != 0) last_enc_event_ms = now;
       data->enc_diff = diff;
+    }
   } else {
     data->enc_diff = 0;
   }
@@ -451,7 +553,40 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     return;
   }
 
-  /* ---- Smart Home ekranı ---- */
+  /* ---- Smart Home ekranı ----
+   * Self-contained long-press handler matching the settings pattern:
+   *   * short press (PR+REL+key=ENTER) -> LVGL fires button CLICKED
+   *     on the focused widget (living_room_btn / kitchen_btn /
+   *     temperature_btn), so click handlers keep working.
+   *   * 800ms+ hold -> pending_menu_load (display_task -> menu).
+   * No base-mode here: every widget in group_smart_home is a real,
+   * clickable button, so we always send key=ENTER on the first tick
+   * of the press. */
+  /* Music ekranı: encoder kendi grubuna geçsin (play/next/prev butonları). */
+  if (cur == objects.music) {
+    if (lv_indev_get_group(encoder_indev) != group_music) {
+      lv_indev_set_group(encoder_indev, group_music);
+      if (objects.music_playpause_btn)
+        lv_group_focus_obj(objects.music_playpause_btn);
+    }
+  }
+
+  /* Games ekranı: encoder games grubuna geçsin (sadece bricks_btn). */
+  if (cur == objects.games) {
+    if (lv_indev_get_group(encoder_indev) != group_games) {
+      lv_indev_set_group(encoder_indev, group_games);
+      if (objects.bricks_btn)
+        lv_group_focus_obj(objects.bricks_btn);
+    }
+  }
+
+  /* Info ekranı: encoder info grubuna geçsin (boş, sadece SCREEN_LOADED footer). */
+  if (cur == objects.about) {
+    if (lv_indev_get_group(encoder_indev) != group_info) {
+      lv_indev_set_group(encoder_indev, group_info);
+    }
+  }
+
   if (cur == objects.smart_home) {
     if (lv_indev_get_group(encoder_indev) != group_smart_home) {
       lv_indev_set_group(encoder_indev, group_smart_home);
@@ -464,14 +599,200 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
         data->enc_diff = 0;
         return;
       }
+      if (!push_handled) {
+        push_handled  = true;
+        push_start_ms = lv_tick_get();
+        ESP_LOGI("sh", "PUSH pressed (state=PR, no key on press)");
+      }
+      if (lv_tick_get() - push_start_ms >= LONG_PRESS_MS) {
+        long_press_triggered = true;
+        pending_menu_load    = true;
+        menu_just_loaded     = true;
+        push_handled         = false;
+        data->state          = LV_INDEV_STATE_REL;
+        data->key            = 0;
+        data->enc_diff       = 0;
+        ESP_LOGI("sh", "LONG_PRESS -> pending_menu_load");
+        return;
+      }
       data->state = LV_INDEV_STATE_PR;
+    } else {
+      bool short_press = push_handled && !long_press_triggered;
+      if (short_press) {
+        /* Short press: send key=ENTER on RELEASE so LVGL fires CLICKED.
+         * (Sending key on PRESS made click event unreliable here.) */
+        data->key = LV_KEY_ENTER;
+        ESP_LOGI("sh", "PUSH released (short press, key=ENTER on REL, dur=%lums)",
+                 (unsigned long)(lv_tick_get() - push_start_ms));
+      } else {
+        data->key = 0;
+      }
+      if (menu_just_loaded) {
+        menu_just_loaded = false;
+      }
+      push_handled         = false;
+      long_press_triggered = false;
+      data->state          = LV_INDEV_STATE_REL;
+    }
+    return;
+  }
+
+  /* ---- Provision ekranı ----
+   * Self-contained long-press handler: 800ms+ -> settings (parent),
+   * matching the games block pattern. click / short press pass through
+   * to LVGL normally so the prov screen widgets keep working. */
+  if (cur == objects.provision) {
+    if (pushed) {
+      if (menu_just_loaded) {
+        data->state = LV_INDEV_STATE_REL;
+        data->enc_diff = 0;
+        return;
+      }
+      if (!push_handled) {
+        push_handled = true;
+        push_start_ms = lv_tick_get();
+      }
+      if (lv_tick_get() - push_start_ms >= LONG_PRESS_MS) {
+        long_press_triggered = true;
+        pending_settings_load = true;
+        menu_just_loaded = true;
+        push_handled = false;
+        data->state = LV_INDEV_STATE_REL;
+        data->enc_diff = 0;
+        return;
+      }
+      data->state = LV_INDEV_STATE_PR;
+    } else {
+      if (menu_just_loaded) {
+        menu_just_loaded = false;
+      }
+      push_handled = false;
+      long_press_triggered = false;
+      data->state = LV_INDEV_STATE_REL;
+    }
+    return;
+  }
+
+  /* ---- Settings ekranı ----
+   * Two-step focus/edit pattern (memory 2026-06-16):
+   *   - rotate: focus navigation between volume / brightness / prov
+   *   - 1st push: LV_KEY_ENTER PR -> focused slider enters edit mode
+   *     (subsequent rotates change the value, firing
+   *     LV_EVENT_VALUE_CHANGED -> settings_volume/brightness_cb);
+   *     for the prov button, the same key event triggers LV_EVENT_CLICKED
+   *     -> settings_provision_cb.
+   *   - 2nd push: LV_KEY_ENTER REL -> leave edit mode, return to nav.
+   * push_handled toggles per press cycle so we know which "step" we are
+   * on. */
+  /* ---- Assistant (voice / chat) ekranı ----
+   * Long press → menu'ye dön. state=PR korunur ki LVGL last_state'i
+   * PR'da kalsın; bırakma tick'inde settings gibi REL+key=ENTER
+   * göndermeye gerek yok çünkü assistant'ta tıklanabilir widget
+   * yok, sadece push uzun-basınca menüye dönüş. */
+  if (cur == objects.assistant) {
+    /* Encoder grubunu assistant grubuna çevir — menu butonlarına kaçmasın */
+    if (lv_indev_get_group(encoder_indev) != group_assistant) {
+      lv_indev_set_group(encoder_indev, group_assistant);
+      if (objects.mic)
+        lv_group_focus_obj(objects.mic);
+    }
+    if (pushed) {
+      if (menu_just_loaded) {
+        data->state = LV_INDEV_STATE_REL;
+        data->enc_diff = 0;
+        return;
+      }
+      if (!push_handled) {
+        push_handled = true;
+        push_start_ms = lv_tick_get();
+      }
+      if (lv_tick_get() - push_start_ms >= LONG_PRESS_MS) {
+        long_press_triggered = true;
+        pending_menu_load = true;
+        menu_just_loaded = true;
+        push_handled = false;
+        data->state = LV_INDEV_STATE_REL;
+        data->enc_diff = 0;
+        return;
+      }
+      data->state = LV_INDEV_STATE_PR;
+    } else {
+      if (menu_just_loaded) {
+        menu_just_loaded = false;
+      }
+      push_handled = false;
+      long_press_triggered = false;
+      data->state = LV_INDEV_STATE_REL;
+    }
+    return;
+  }
+
+  if (cur == objects.settings) {
+    if (lv_indev_get_group(encoder_indev) != group_settings) {
+      lv_indev_set_group(encoder_indev, group_settings);
+      if (objects.volume)
+        lv_group_focus_obj(objects.volume);
+    }
+    /* "Base mode" = focus is on the invisible placeholder widget created
+     * in display_task, meaning no real slider/button is selected. In
+     * base mode a short press does nothing (key=0, no CLICKED event)
+     * and a long press jumps back to menu. */
+    lv_obj_t *focused_obj =
+        (group_settings ? lv_group_get_focused(group_settings) : NULL);
+    bool in_base_mode =
+        (focused_obj != NULL) && (focused_obj == settings_base_obj);
+    if (pushed) {
+      if (menu_just_loaded) {
+        data->state = LV_INDEV_STATE_REL;
+        data->enc_diff = 0;
+        return;
+      }
+      if (!push_handled) {
+        /* First tick of the press: send PR + key. In normal mode key=ENTER
+         * so LVGL toggles slider edit-mode / fires button click on the
+         * PR->REL pair. In base mode key=0 so nothing fires (safe state). */
+        push_handled = true;
+        push_start_ms = lv_tick_get();
+        data->key = in_base_mode ? 0 : LV_KEY_ENTER;
+        data->state = LV_INDEV_STATE_PR;
+      } else {
+        if (lv_tick_get() - push_start_ms >= LONG_PRESS_MS) {
+          /* Long press in either mode -> menu. */
+          long_press_triggered = true;
+          pending_menu_load = true;
+          menu_just_loaded = true;
+          push_handled = false;
+          data->state = LV_INDEV_STATE_REL;
+          data->enc_diff = 0;
+          return;
+        }
+        /* Hold phase: keep state=PR (not REL) so LVGL's keypad.last_state
+         * stays PRESSED across the hold. */
+        data->key = 0;
+        data->state = LV_INDEV_STATE_PR;
+      }
+      data->enc_diff = 0;
     } else {
       if (menu_just_loaded) {
         menu_just_loaded = false;
         push_handled = false;
       }
+      if (push_handled) {
+        /* Falling edge: button released. In normal mode complete with
+         * REL + key=ENTER (slider edit toggle / button click). In base
+         * mode key=0 (no click fires). */
+        push_handled = false;
+        data->key = in_base_mode ? 0 : LV_KEY_ENTER;
+        data->state = LV_INDEV_STATE_REL;
+      } else {
+        data->state = LV_INDEV_STATE_REL;
+      }
       long_press_triggered = false;
-      data->state = LV_INDEV_STATE_REL;
+      /* Do NOT zero data->enc_diff here — encoder_get_diff() at the
+       * top of encoder_read() already populated it, and zeroing it
+       * kills rotate-driven focus navigation. Smart-home block has
+       * the same pattern (no enc_diff assignment in else branch) and
+       * that's why navigation works there. */
     }
     return;
   }
@@ -581,6 +902,24 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
 
 /* ----------------------------------------------------------------------- */
 
+/* HAL 9000 geçici test toggle task'i (her 8s start/stop).
+ * İleride chat_task WS event'lerinden ai_hal9000_start()/stop() ile
+ * değiştirilecek (AI konuşmaya başlayınca start, susunca stop).
+ * Bu task'i silmek için bu bloğu + alttaki xTaskCreate'i kaldır. */
+static void hal9000_test_task(void *pv) {
+  (void)pv;
+  bool active = false;
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(8000));
+    if (active) {
+      ai_hal9000_stop();
+    } else {
+      ai_hal9000_start();
+    }
+    active = !active;
+  }
+}
+
 static void display_task(void *pv) {
   (void)pv;
 
@@ -590,50 +929,65 @@ static void display_task(void *pv) {
 
   if (lvgl_port_lock(0)) {
     ui_init();
-    /* Wire up smart-home button click events. */
-    if (objects.living_room_btn)
-      lv_obj_add_event_cb(objects.living_room_btn, smart_home_living_room_cb,
-                          LV_EVENT_CLICKED, NULL);
-    if (objects.kitchen_btn)
-      lv_obj_add_event_cb(objects.kitchen_btn, smart_home_kitchen_cb,
-                          LV_EVENT_CLICKED, NULL);
-    if (objects.temperature_btn)
-      lv_obj_add_event_cb(objects.temperature_btn, smart_home_temperature_cb,
-                          LV_EVENT_CLICKED, NULL);
+    /* HAL 9000 animasyonunu aivoice container içinde oluştur (başta gizli).
+     * chat_task WS event'lerinden ai_hal9000_start()/stop() çağırır. */
+    if (objects.aivoice) {
+      ai_hal9000_create(objects.aivoice);
+    }
+    /* Smart Home buton callback'leri screens.c tarafından bağlı (çift kayıt yapma). */
     /* Settings page: hook the Provision button. The page also has
      * volume and brightness sliders whose initial value is set by
-     * eez_wrapper.cpp (ui_set_volume / ui_set_brightness). */
+     * eez_wrapper.cpp (ui_set_volume / ui_set_brightness).
+     * Callbacks stay here; the lv_group_add_obj calls live next to
+     * the other group setup blocks below so each screen owns its
+     * own group (group_settings). */
     if (objects.prov) {
-      lv_obj_add_event_cb(objects.prov, settings_provision_cb,
-                          LV_EVENT_CLICKED, NULL);
-      lv_group_add_obj(group_menu, objects.prov);
+      lv_obj_add_event_cb(objects.prov, settings_provision_cb, LV_EVENT_CLICKED,
+                          NULL);
     }
     if (objects.volume) {
       lv_obj_add_event_cb(objects.volume, settings_volume_cb,
                           LV_EVENT_VALUE_CHANGED, NULL);
-      lv_group_add_obj(group_menu, objects.volume);
     }
     if (objects.brightness) {
       lv_obj_add_event_cb(objects.brightness, settings_brightness_cb,
                           LV_EVENT_VALUE_CHANGED, NULL);
-      lv_group_add_obj(group_menu, objects.brightness);
     }
     lv_scr_load(objects.splash);
     lv_indev_set_group(encoder_indev, NULL);
     lvgl_port_unlock();
   }
 
+  /* Assistant group: encoder sadece assistant ekranındayken bu gruba geçer.
+   * İçinde sadece assistant ekranındaki focusable objeler var (mic, ai_anim vs.),
+   * böylece encoder menu butonlarına (Music/Smart Home/Games) kaçmaz. */
+  group_assistant = lv_group_create();
+  lv_group_set_default(group_assistant);
+  if (objects.assistant) {
+    /* Assistant container'ı clickable yap ki encoder focus edebilsin */
+    lv_obj_add_flag(objects.assistant, LV_OBJ_FLAG_CLICKABLE);
+    lv_group_add_obj(group_assistant, objects.assistant);
+  }
+  if (objects.mic) {
+    /* mic (lv_image) default clickable değil — encoder'ın focus edebilmesi için flag ekle */
+    lv_obj_add_flag(objects.mic, LV_OBJ_FLAG_CLICKABLE);
+    lv_group_add_obj(group_assistant, objects.mic);
+  }
+
   if (group_menu) {
-    if (objects.asistant_button)
+    if (objects.asistant_button) {
+      /* Görünür olduğundan emin ol (EEZ'de bazen hidden flag kalabiliyor) */
+      lv_obj_clear_flag(objects.asistant_button, LV_OBJ_FLAG_HIDDEN);
       lv_group_add_obj(group_menu, objects.asistant_button);
+    }
     if (objects._music_button_)
       lv_group_add_obj(group_menu, objects._music_button_);
     if (objects._smart_home_button_)
       lv_group_add_obj(group_menu, objects._smart_home_button_);
     if (objects._games_button_)
       lv_group_add_obj(group_menu, objects._games_button_);
-    if (objects.bricks_btn)
-      lv_group_add_obj(group_menu, objects.bricks_btn);
+    /* bricks_btn games ekranında, menu'de değil → group_menu'ye EKLEMEYELİZ
+     * (boş adım yaratır). Sadece group_games'te var. */
     if (objects._settings_button_)
       lv_group_add_obj(group_menu, objects._settings_button_);
     if (objects._about_button_)
@@ -647,6 +1001,27 @@ static void display_task(void *pv) {
       lv_group_add_obj(group_smart_home, objects.kitchen_btn);
     if (objects.temperature_btn)
       lv_group_add_obj(group_smart_home, objects.temperature_btn);
+  }
+
+  if (group_settings) {
+    if (objects.volume)
+      lv_group_add_obj(group_settings, objects.volume);
+    if (objects.brightness)
+      lv_group_add_obj(group_settings, objects.brightness);
+    if (objects.prov)
+      lv_group_add_obj(group_settings, objects.prov);
+    /* 4. navigation item: an invisible "base" placeholder so the user
+     * can rotate past prov and land on a safe state with nothing
+     * focused. Long press in base mode -> menu (handled in
+     * encoder_read). This makes it always possible to escape a
+     * settings screen without accidentally editing a slider. */
+    if (!settings_base_obj && objects.settings) {
+      settings_base_obj = lv_obj_create(objects.settings);
+      lv_obj_set_size(settings_base_obj, 1, 1);
+      /* fully transparent (invisible) but still in the focus group */
+      lv_obj_set_style_opa(settings_base_obj, 0, 0);
+      lv_group_add_obj(group_settings, settings_base_obj);
+    }
   }
 
   last_activity_tick = lv_tick_get();
@@ -663,6 +1038,17 @@ static void display_task(void *pv) {
           if (objects.asistant_button)
             lv_group_focus_obj(objects.asistant_button);
           encoder_reset_count();
+          ESP_LOGI("disp", "pending_menu_load processed -> menu");
+        }
+        if (pending_settings_load) {
+          pending_settings_load = false;
+          /* Provision page's 800ms+ back-nav -> settings (parent). */
+          lv_scr_load(objects.settings);
+          lv_indev_set_group(encoder_indev, group_settings);
+          if (objects.volume)
+            lv_group_focus_obj(objects.volume);
+          encoder_reset_count();
+          ESP_LOGI("disp", "pending_settings_load processed -> settings");
         }
         lvgl_port_unlock();
       }
@@ -672,6 +1058,9 @@ static void display_task(void *pv) {
         if (idle >= SLEEP_TIMEOUT_MS) {
           display_backlight_off();
           display_sleeping = true;
+          /* Not: encoder tamamen devre dışı BIRAKILMAZ (push wake_up için gerekli).
+           * encoder_read() callback'i display_sleeping=true olduğunda
+           * enc_diff=0 ve REL döndürür → LVGL grup focus değişmez. */
           ESP_LOGI(TAG, "Display sleep");
         }
       }
@@ -697,7 +1086,8 @@ void app_main(void) {
    * widget-tree access in PSRAM hits an uncached line and triggers a
    * Load access fault on RISC-V (cleanup_event_list_core crashes). */
   ESP_LOGI(TAG, "PSRAM warmup...");
-  uint32_t *probe = (uint32_t *)heap_caps_malloc(1024 * 1024, MALLOC_CAP_SPIRAM);
+  uint32_t *probe =
+      (uint32_t *)heap_caps_malloc(1024 * 1024, MALLOC_CAP_SPIRAM);
   if (probe) {
     volatile uint32_t sum = 0;
     for (int i = 0; i < (1024 * 1024) / 4; i += 64) {
@@ -713,6 +1103,11 @@ void app_main(void) {
   ESP_LOGI(TAG, "LVGL...");
   const lvgl_port_cfg_t lcfg = ESP_LVGL_PORT_INIT_CONFIG();
   ESP_ERROR_CHECK(lvgl_port_init(&lcfg));
+  /* LVGL_PSRAM_FORCE: CONFIG_LV_USE_CUSTOM_MALLOC=y seçildi — lv_malloc_core/free_core/
+   * realloc_core aşağıda tanımlandı, heap_caps SPIRAM'e yönlendiriyor.
+   * (LVGL 9.5'te builtin malloc 64 KB internal RAM TLSF havuzu, HAL 9000 widget'ları
+   * + animasyonlar fragment edip insert_free_block merge recursion 5+ sn sürüyordu —
+   * watchdog tetikleniyordu. PSRAM 32 MB, fragmentation imkansız.) */
 
   const lvgl_port_display_cfg_t dcfg = {
       .io_handle = display_get_io_handle(),
@@ -737,6 +1132,21 @@ void app_main(void) {
   lv_indev_set_type(encoder_indev, LV_INDEV_TYPE_ENCODER);
   group_menu = lv_group_create();
   group_smart_home = lv_group_create();
+  group_settings = lv_group_create();
+  group_assistant = lv_group_create();
+  group_music = lv_group_create();
+  group_games = lv_group_create();
+  group_info = lv_group_create();
+  /* group_assistant objeleri yukarıda eklendi (mic/assistant/ai_anim). */
+  if (objects.music_playpause_btn)
+    lv_group_add_obj(group_music, objects.music_playpause_btn);
+  if (objects.music_next_btn)
+    lv_group_add_obj(group_music, objects.music_next_btn);
+  if (objects.music_prev_btn)
+    lv_group_add_obj(group_music, objects.music_prev_btn);
+  if (objects.bricks_btn)
+    lv_group_add_obj(group_games, objects.bricks_btn);
+  /* group_info boş (ekranda focusable obje yok). */
 
   wifi_station_config_t wc = {
       .ssid = WIFI_SSID, .password = WIFI_PASS, .max_retry = 5};
@@ -751,6 +1161,11 @@ void app_main(void) {
   // Pin display_task to CPU0 so it runs on same core as LVGL task
   xTaskCreatePinnedToCore(display_task, "display_task", 16384, NULL, 5, NULL,
                           0);
+
+  /* Geçici: HAL 9000 animasyonunu 8 saniyede bir toggle et, böylece
+   * assistant ekranına gidince gözün pulse + ring rotate ettiğini görebilirsin.
+   * İleride bu satırı kaldır, chat_task içinden WS event ile çağır. */
+  xTaskCreate(hal9000_test_task, "hal9000_test", 4096, NULL, 1, NULL);
 
   ESP_LOGI(TAG, "========== Ready ==========");
   while (1)

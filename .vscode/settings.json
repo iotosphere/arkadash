@@ -20,5 +20,5 @@
   "idf.espIdfPath": "/Users/serhatsaday/esp/v5.5.1/esp-idf",
   "idf.toolsPath": "/Users/serhatsaday/.espressif",
   "idf.port": "/dev/tty.usbmodem5AB01729681",
-  "idf.currentSetup": "/Users/serhatsaday/esp/esp-idf"
+  "idf.currentSetup": "/Users/serhatsaday/.espressif/v6.0.1/esp-idf"
 }

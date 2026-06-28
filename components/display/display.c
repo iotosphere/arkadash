@@ -67,17 +67,30 @@ static void init_lcd_panel(void)
 
 static void init_backlight(void)
 {
-    ESP_LOGI(TAG, "Backlight GPIO:%d", TFT_BLK);
+    ESP_LOGI(TAG, "Backlight GPIO:%d (PWM via LEDC)", TFT_BLK);
 
-    const gpio_config_t bk_cfg = {
-        .pin_bit_mask = (1ULL << TFT_BLK),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
+    /* LEDC timer — 5 kHz, 8-bit duty. High enough to avoid visible
+     * flicker, low enough not to stress the FET on the backlight line. */
+    const ledc_timer_config_t ledc_timer = {
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .freq_hz         = 5000,
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .timer_num       = LEDC_TIMER_0,
+        .clk_cfg         = LEDC_AUTO_CLK,
     };
-    ESP_ERROR_CHECK(gpio_config(&bk_cfg));
-    gpio_set_level(TFT_BLK, LCD_BK_LIGHT_ON_LEVEL);
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    const ledc_channel_config_t ledc_channel = {
+        .gpio_num   = TFT_BLK,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 255,   /* start full brightness */
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 }
 
 esp_err_t display_init(void)
@@ -104,13 +117,15 @@ esp_lcd_panel_handle_t display_get_panel_handle(void)
 
 void display_backlight_off(void)
 {
-    gpio_set_level(TFT_BLK, !LCD_BK_LIGHT_ON_LEVEL);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     ESP_LOGI(TAG, "Backlight OFF");
 }
 
 void display_backlight_on(void)
 {
-    gpio_set_level(TFT_BLK, LCD_BK_LIGHT_ON_LEVEL);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 255);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     ESP_LOGI(TAG, "Backlight ON");
 }
 

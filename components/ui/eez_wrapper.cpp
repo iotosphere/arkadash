@@ -4,6 +4,10 @@
 #include "screens.h"
 #include "images.h"
 #include <stdio.h>
+#include "esp_lvgl_port.h"
+#include "esp_log.h"
+
+static const char *TAG = "ui";
 
 using namespace eez;
 
@@ -25,6 +29,11 @@ extern "C" {
 
 void ui_set_time(int hour, int minute, int second, int date, const char *month_str, int year, const char *day_name)
 {
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_time: LVGL lock timeout, skipping");
+        return;
+    }
+
     static char hour_str[3];
     static char minute_str[3];
     static char second_str[3];
@@ -46,10 +55,17 @@ void ui_set_time(int hour, int minute, int second, int date, const char *month_s
     if (day_name) {
         flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_TIME_DAY_NAME, Value(day_name));
     }
+
+    lvgl_port_unlock();
 }
 
 void ui_set_weather(const char *temp, const char *condition, const char *humidity)
 {
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_weather: LVGL lock timeout, skipping");
+        return;
+    }
+
     printf("ui_set_weather: temp=%s hum=%s cond=%s\n",
            temp ? temp : "(null)",
            humidity ? humidity : "(null)",
@@ -81,16 +97,25 @@ void ui_set_weather(const char *temp, const char *condition, const char *humidit
         lv_label_set_text(objects.weather_state, condition);
         printf("  -> Set state label OK\n");
     }
+
+    lvgl_port_unlock();
 }
 
 void ui_set_weather_icon(int weather_code)
 {
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_weather_icon: LVGL lock timeout, skipping");
+        return;
+    }
+
     printf("ui_set_weather_icon: code=%d, weather_icon=%p\n", weather_code, (void*)objects.weather_icon);
     if (objects.weather_icon) {
         const lv_img_dsc_t *icon = weather_code_to_icon(weather_code);
         lv_image_set_src(objects.weather_icon, icon);
         printf("  -> Set icon OK\n");
     }
+
+    lvgl_port_unlock();
 }
 
 /* -----------------------------------------------------------------------
@@ -115,6 +140,11 @@ static const lv_img_dsc_t* pick_battery_icon(int pct, bool charging)
 
 void ui_set_battery_state(int percent, bool charging)
 {
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_battery_state: LVGL lock timeout, skipping");
+        return;
+    }
+
     if (percent < 0)   percent = 0;
     if (percent > 100) percent = 100;
 
@@ -135,17 +165,33 @@ void ui_set_battery_state(int percent, bool charging)
     if (objects.battery) {
         lv_image_set_src(objects.battery, icon);
     }
+
+    lvgl_port_unlock();
 }
 
 void ui_set_footer(const char *text)
 {
-    printf("ui_set_footer: text=%s\n", text ? text : "(null)");
-    
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_footer: LVGL lock timeout, skipping");
+        return;
+    }
+
+    // Debounce: ayni text 100ms icinde tekrar set edilirse log'lama.
+    // Encoder bounce spam'ini engeller.
+    static const char *last_text = nullptr;
+    static uint32_t last_ms = 0;
+    uint32_t now = lv_tick_get();
+    if (!(text && last_text == text && (now - last_ms) < 100)) {
+        printf("ui_set_footer: text=%s\n", text ? text : "(null)");
+        last_text = text;
+        last_ms = now;
+    }
+
     // Update header label on assistant screen
     if (objects.obj4) {
         lv_label_set_text(objects.obj4, text);
     }
-    
+
     // Update all author (footer) labels
     if (objects.author && text) {
         lv_label_set_text(objects.author, text);
@@ -171,6 +217,8 @@ void ui_set_footer(const char *text)
     if (objects.author_7 && text) {
         lv_label_set_text(objects.author_7, text);
     }
+
+    lvgl_port_unlock();
 }
 
 /* Settings page sliders — called from main.c when the user moves
@@ -178,26 +226,44 @@ void ui_set_footer(const char *text)
  * and display backlight APIs. */
 void ui_set_volume(int pct)
 {
-    if (!objects.volume) return;
-    /* Clamp to slider's configured range (0..100). */
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    lv_slider_set_value(objects.volume, pct, LV_ANIM_OFF);
-    /* Forward to audio_set_volume(). main.c's settings_volume_cb also
-     * calls this directly, so this is the single point of truth. */
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_volume: LVGL lock timeout, skipping");
+        return;
+    }
+
+    if (objects.volume) {
+        /* Clamp to slider's configured range (0..100). */
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        lv_slider_set_value(objects.volume, pct, LV_ANIM_OFF);
+    }
+
+    /* Forward to audio_set_volume() even if slider object is missing —
+     * audio path is independent of LVGL widget state. */
     extern void audio_set_volume(int pct);
     audio_set_volume(pct);
+
+    lvgl_port_unlock();
 }
 
 void ui_set_brightness(int pct)
 {
-    if (!objects.brightness) return;
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    lv_slider_set_value(objects.brightness, pct, LV_ANIM_OFF);
-    /* Forward to display backlight PWM. */
+    if (!lvgl_port_lock(500)) {
+        ESP_LOGW(TAG, "ui_set_brightness: LVGL lock timeout, skipping");
+        return;
+    }
+
+    if (objects.brightness) {
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        lv_slider_set_value(objects.brightness, pct, LV_ANIM_OFF);
+    }
+
+    /* Forward to display backlight PWM even if slider object is missing. */
     extern void display_backlight_set(uint8_t pct);
     display_backlight_set((uint8_t)pct);
+
+    lvgl_port_unlock();
 }
 
 }

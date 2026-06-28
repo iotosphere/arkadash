@@ -6,6 +6,7 @@ idf_component_register(
         "images.c"
         "eez-flow.cpp"
         "eez_wrapper.cpp"
+        "ai_hal9000.c"
         "ui_image_50.c"
         "ui_image_80.c"
         "ui_image_ai_asistant.c"
@@ -51,6 +52,7 @@ idf_component_register(
         "ui_image_temperature.c"
         "ui_image_thread.c"
         "ui_image_matter.c"
+        "ui_image_aianim.c"
     INCLUDE_DIRS "." "include"
     REQUIRES esp_lvgl_port
     PRIV_REQUIRES lvgl esp_lvgl_port display encoder freertos esp_timer games

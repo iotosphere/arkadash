@@ -63,7 +63,7 @@ static void event_handler_cb_menu_asistant_button(lv_event_t *e) {
     lv_event_code_t event = lv_event_get_code(e);
     void *flowState = lv_event_get_user_data(e);
     (void)flowState;
-    
+
     if (event == LV_EVENT_FOCUSED) {
         ui_set_footer("Assistant");
     }
@@ -135,7 +135,7 @@ static void event_handler_cb_menu__about_button_(lv_event_t *e) {
     (void)flowState;
     
     if (event == LV_EVENT_FOCUSED) {
-        ui_set_footer("Info");
+        ui_set_footer("About");
     }
     if (event == LV_EVENT_RELEASED) {
         e->user_data = (void *)0;
@@ -149,7 +149,7 @@ static void event_handler_cb_assistant_assistant(lv_event_t *e) {
     (void)flowState;
     
     if (event == LV_EVENT_SCREEN_LOADED) {
-        ui_set_footer("Asistant");
+        ui_set_footer("Assistant");
     }
     if (event == LV_EVENT_LONG_PRESSED) {
         e->user_data = (void *)0;
@@ -986,6 +986,9 @@ void create_screen_assistant() {
             lv_obj_set_style_bg_color(obj, lv_color_hex(0xffa1a1a1), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_opa(obj, 70, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_radius(obj, 25, LV_PART_MAIN | LV_STATE_DEFAULT);
+            // HAL 9000 eye (aianim) — 2026-06-28 izole test: aianim widget tamamen kaldırıldı
+            // Sorunun kaynağını bulmak için. Asistan ekranına girmek watchdog tetikliyordu,
+            // aianim gizli olsa bile tetikleniyordu. Şimdi sadece clean aivoice container var.
         }
         {
             // microphone

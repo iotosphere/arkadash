@@ -7,7 +7,12 @@ STT: whisper.cpp server | LLM: MiniMax-M2.7 | TTS: Edge
 FIX: Session history artık WebSocket object ID yerine client IP adresine
      bağlıdır. ESP32 reconnect etse bile aynı IP'den geldiği için
      konuşma geçmişi korunur.
+
+Spotify Remote: SPOTIFY_* komutları ile playlist browse ve playback control
 """
+
+import sys
+sys.path.insert(0, '/Users/serhatsaday/arkadash/orch/lib/python3.14/site-packages')
 
 import asyncio
 import os
@@ -16,15 +21,17 @@ import wave
 import struct
 import array
 import tempfile
+import subprocess
 import httpx
 import websockets
 from typing import AsyncGenerator
+import random
 
 MINIMAX_API_KEY  = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
-TTS_BACKEND   = os.environ.get("TTS_BACKEND", "edge")
+TTS_BACKEND   = os.environ.get("TTS_BACKEND", "minimax")
 WHISPER_SERVER = "http://localhost:8080"
 
 # ZeroClaw Gateway (opsiyonel)
@@ -44,6 +51,276 @@ active_pipelines:       dict[str, bool]  = {}
 
 # History kaç mesaj sonra eskiler temizlensin (token tasarrufu)
 MAX_HISTORY_TURNS = 20  # kullanıcı + asistan mesaj sayısı
+
+# ─── LED Control (ESP32-S3 HTTP API → Matter → ESP32-H2) ──────────────────────
+
+ESP32_S3_HTTP_BASE = "http://192.168.1.15:8766"
+
+async def led_toggle():
+    """Toggle living room LED via ESP32-S3."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{ESP32_S3_HTTP_BASE}/led/toggle")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[LED] Toggle error: {e}")
+        return False
+
+async def led_set_color(color_x: int, color_y: int):
+    """Set living room LED color (CIE xyY) via ESP32-S3."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(
+                f"{ESP32_S3_HTTP_BASE}/led/color",
+                params={"x": color_x, "y": color_y}
+            )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[LED] Color error: {e}")
+        return False
+
+async def led_set_brightness(level: int):
+    """Set living room LED brightness (0-254) via ESP32-S3."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(
+                f"{ESP32_S3_HTTP_BASE}/led/brightness",
+                params={"level": level}
+            )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[LED] Brightness error: {e}")
+        return False
+
+async def led_get_status():
+    """Get living room LED status from ESP32-S3."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{ESP32_S3_HTTP_BASE}/led/status")
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception as e:
+        print(f"[LED] Status error: {e}")
+        return None
+
+
+# ─── Spotify Control (Web API) ───────────────────────────────────────────────
+
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_CACHE_PATH = os.path.expanduser("~/.cache/spotify_token")
+
+spotify_token = None
+spotify_token_expiry = 0
+
+async def refresh_spotify_token():
+    """OAuth2 token yenile veya al."""
+    global spotify_token, spotify_token_expiry
+    
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        print("[Spotify] Credentials not set (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)")
+        return False
+    
+    try:
+        import spotipy
+        from spotipy.oauth2 import SpotifyOAuth
+        
+        oauth = SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri="http://127.0.0.1:8080/callback",
+            scope="user-read-playback-state user-modify-playback-state playlist-read-private",
+            cache_path=SPOTIFY_CACHE_PATH
+        )
+        
+        token_info = oauth.get_cached_token()
+        if not token_info:
+            print("[Spotify] No cached token - need to authenticate")
+            return False
+        
+        spotify_token = token_info["access_token"]
+        spotify_token_expiry = asyncio.get_event_loop().time() + token_info["expires_in"]
+        print("[Spotify] Token refreshed, expires in", token_info["expires_in"])
+        return True
+    except Exception as e:
+        print(f"[Spotify] Token refresh error: {e}")
+        return False
+
+def get_spotify_headers():
+    global spotify_token, spotify_token_expiry
+    if not spotify_token or asyncio.get_event_loop().time() > spotify_token_expiry:
+        return None
+    return {"Authorization": f"Bearer {spotify_token}"}
+
+async def spotify_get_playlists():
+    """Kullanıcının playlistlerini döndür."""
+    headers = get_spotify_headers()
+    if not headers:
+        return []
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.spotify.com/v1/me/playlists",
+                headers=headers,
+                params={"limit": 50}
+            )
+        if response.status_code == 200:
+            data = response.json()
+            playlists = [{"id": p["id"], "name": p["name"]} for p in data.get("items", [])]
+            return playlists
+        else:
+            print(f"[Spotify] Playlists error: {response.status_code}")
+            return []
+    except Exception as e:
+        print(f"[Spotify] Get playlists error: {e}")
+        return []
+
+async def spotify_play_random_from_playlist(playlist_id: str):
+    """Playlist'ten rastgele şarkı çal."""
+    headers = get_spotify_headers()
+    if not headers:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+                headers=headers,
+                params={"fields": "items(track(id,name,artists(name)))"}
+            )
+        
+        if response.status_code != 200:
+            print(f"[Spotify] Playlist tracks error: {response.status_code}")
+            return False
+        
+        data = response.json()
+        tracks = data.get("items", [])
+        if not tracks:
+            print("[Spotify] Empty playlist")
+            return False
+        
+        track = random.choice(tracks)
+        if not track.get("track") or not track["track"].get("id"):
+            print("[Spotify] Invalid track")
+            return False
+        
+        track_id = track["track"]["id"]
+        
+        async with httpx.AsyncClient() as client:
+            devices_resp = await client.get(
+                "https://api.spotify.com/v1/me/player/devices",
+                headers=headers
+            )
+        
+        device_id = None
+        if devices_resp.status_code == 200:
+            devices = devices_resp.json().get("devices", [])
+            for d in devices:
+                if d["is_active"]:
+                    device_id = d["id"]
+                    break
+            if not device_id and devices:
+                device_id = devices[0]["id"]
+        
+        if not device_id:
+            print("[Spotify] No active device")
+            return False
+        
+        async with httpx.AsyncClient() as client:
+            play_resp = await client.put(
+                "https://api.spotify.com/v1/me/player/play",
+                headers=headers,
+                json={
+                    "context_uri": f"spotify:playlist:{playlist_id}",
+                    "offset": {"position": random.randint(0, len(tracks)-1)},
+                    "device_id": device_id
+                }
+            )
+        
+        if play_resp.status_code in (200, 204):
+            print(f"[Spotify] Playing random track from playlist {playlist_id}")
+            return True
+        else:
+            print(f"[Spotify] Play error: {play_resp.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"[Spotify] Play error: {e}")
+        return False
+
+async def spotify_get_current_track():
+    """Çalan şarkı bilgisini döndür."""
+    headers = get_spotify_headers()
+    if not headers:
+        return {"title": "", "artist": "", "is_playing": False}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.spotify.com/v1/me/player/currently-playing",
+                headers=headers
+            )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data.get("item"):
+                track = data["item"]
+                return {
+                    "title": track.get("name", ""),
+                    "artist": ", ".join(a["name"] for a in track.get("artists", [])),
+                    "is_playing": data.get("is_playing", False)
+                }
+        return {"title": "", "artist": "", "is_playing": False}
+    except Exception as e:
+        print(f"[Spotify] Get current track error: {e}")
+        return {"title": "", "artist": "", "is_playing": False}
+
+async def spotify_pause():
+    """Pause playback."""
+    headers = get_spotify_headers()
+    if not headers:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.spotify.com/v1/me/player/pause",
+                headers=headers
+            )
+        return response.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Spotify] Pause error: {e}")
+        return False
+
+async def spotify_resume():
+    """Resume playback."""
+    headers = get_spotify_headers()
+    if not headers:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.spotify.com/v1/me/player/play",
+                headers=headers
+            )
+        return response.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Spotify] Resume error: {e}")
+        return False
+
+async def spotify_skip():
+    """Skip to next track."""
+    headers = get_spotify_headers()
+    if not headers:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.spotify.com/v1/me/player/next",
+                headers=headers
+            )
+        return response.status_code in (200, 204)
+    except Exception as e:
+        print(f"[Spotify] Skip error: {e}")
+        return False
 
 
 # ─── STT ──────────────────────────────────────────────────────────────────────
@@ -285,6 +562,103 @@ def clean_text_for_tts(text: str) -> str:
 
 # ─── TTS ──────────────────────────────────────────────────────────────────────
 
+async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
+    """MiniMax speech-hd TTS (synchronous - tüm audio bir seferde gelir)."""
+    try:
+        import numpy as np
+        from scipy.signal import resample_poly
+
+        url = f"https://api.minimax.io/v1/t2a_v2?GroupId={MINIMAX_GROUP_ID}"
+        headers = {
+            "Authorization": f"Bearer {MINIMAX_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "speech-2.8-hd",
+            "text": text,
+            "stream": False,
+            "voice_setting": {
+                "voice_id": "Turkish_CalmWoman"
+            },
+            "audio_setting": {
+                "sample_rate": 24000,
+                "bitrate": 128000,
+                "format": "mp3"
+            }
+        }
+
+        print(f"[TTS-MiniMax] Requesting (sync): '{text[:50]}...'")
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(url, headers=headers, json=payload)
+
+        if response.status_code != 200:
+            print(f"[TTS-MiniMax] HTTP {response.status_code}: {response.text[:300]}")
+            return
+
+        try:
+            json_data = response.json()
+        except Exception:
+            print(f"[TTS-MiniMax] Failed to parse JSON response: {response.text[:200]}")
+            return
+
+        audio_hex = json_data.get("data", {}).get("audio", "")
+        if not audio_hex:
+            print(f"[TTS-MiniMax] No audio in response: {list(json_data.keys())}")
+            return
+
+        mp3_data = bytes.fromhex(audio_hex)
+        print(f"[TTS-MiniMax] MP3 decoded from hex: {len(mp3_data)} bytes")
+
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f_in:
+            f_in.write(mp3_data)
+            mp3_path = f_in.name
+        pcm_path = mp3_path + '.pcm'
+
+        print(f"[TTS-MiniMax] MP3 file written to {mp3_path}")
+
+        try:
+            result = subprocess.run([
+                'ffmpeg', '-y', '-v', 'debug', '-f', 'mp3', '-i', mp3_path,
+                '-f', 's16le', '-acodec', 'pcm_s16le',
+                '-ar', '24000', '-ac', '1', pcm_path
+            ], capture_output=True, timeout=60)
+
+            stderr = result.stderr.decode('utf-8', errors='replace')
+            stdout = result.stdout.decode('utf-8', errors='replace')
+            
+            print(f"[TTS-MiniMax] ffmpeg rc={result.returncode}")
+            if result.returncode != 0:
+                print(f"[TTS-MiniMax] ffmpeg STDOUT (first 300): {stdout[:300]}")
+                print(f"[TTS-MiniMax] ffmpeg STDERR (first 500): {stderr[:500]}")
+                return
+
+            with open(pcm_path, 'rb') as f:
+                pcm_data = f.read()
+
+            samples_24k = np.frombuffer(pcm_data, dtype=np.int16)
+            samples_16k = resample_poly(samples_24k, 2, 3).astype(np.int16)
+            pcm_mono = samples_16k.tobytes()
+
+            duration = len(pcm_mono) / (16000 * 2)
+            print(f"[TTS-MiniMax] PCM: {len(pcm_mono)} bytes, {duration:.2f}s @ 16kHz mono")
+
+            chunk_size = 1024
+            for i in range(0, len(pcm_mono), chunk_size):
+                yield pcm_mono[i:i+chunk_size]
+
+            print("[TTS-MiniMax] Complete")
+
+        finally:
+            os.unlink(mp3_path)
+            if os.path.exists(pcm_path):
+                os.unlink(pcm_path)
+
+    except Exception as e:
+        print(f"[TTS-MiniMax] Error: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc()
+
+
 async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
     try:
         import edge_tts
@@ -415,6 +789,9 @@ async def tts_stream(text: str) -> AsyncGenerator[bytes, None]:
     elif TTS_BACKEND == "google_cloud":
         async for chunk in tts_google_cloud_stream(text):
             yield chunk
+    elif TTS_BACKEND == "minimax":
+        async for chunk in tts_minimax_stream(text):
+            yield chunk
     else:
         async for chunk in tts_gemini_stream(text):
             yield chunk
@@ -474,7 +851,7 @@ async def process_audio(websocket, session_id: str, audio_buffer: bytearray, use
         print(f"[TTS] All PCM sent ({total_pcm_bytes} bytes), sending tts_end")
         await websocket.send(json.dumps({"type": "tts_end", "size": total_pcm_bytes}))
 
-        playback_duration = total_pcm_bytes / (16000 * 2 * 2)
+        playback_duration = total_pcm_bytes / (16000 * 2)
         print(f"[+] Playback: {playback_duration:.2f}s")
         await asyncio.sleep(playback_duration + 0.5)
 
@@ -546,6 +923,100 @@ async def handle_client(websocket):
                     else:
                         print(f"[!] Audio too short: {len(audio_buffer)} bytes")
 
+                # ── Spotify Control ──────────────────────────────────────────────
+                elif msg_stripped == "SPOTIFY_LIST":
+                    playlists = await spotify_get_playlists()
+                    await websocket.send(json.dumps({
+                        "type": "spotify_playlists",
+                        "playlists": playlists
+                    }))
+                elif msg_stripped.startswith("SPOTIFY_PLAY:"):
+                    playlist_id = msg_stripped.split(":", 1)[1]
+                    success = await spotify_play_random_from_playlist(playlist_id)
+                    await websocket.send(json.dumps({
+                        "type": "spotify_play_result",
+                        "success": success
+                    }))
+                elif msg_stripped == "SPOTIFY_STATUS":
+                    track = await spotify_get_current_track()
+                    await websocket.send(json.dumps({
+                        "type": "spotify_status",
+                        "title": track["title"],
+                        "artist": track["artist"],
+                        "is_playing": track["is_playing"]
+                    }))
+                elif msg_stripped == "SPOTIFY_PAUSE":
+                    success = await spotify_pause()
+                    await websocket.send(json.dumps({
+                        "type": "spotify_pause_result",
+                        "success": success
+                    }))
+                elif msg_stripped == "SPOTIFY_RESUME":
+                    success = await spotify_resume()
+                    await websocket.send(json.dumps({
+                        "type": "spotify_resume_result",
+                        "success": success
+                    }))
+                elif msg_stripped == "SPOTIFY_SKIP":
+                    success = await spotify_skip()
+                    await websocket.send(json.dumps({
+                        "type": "spotify_skip_result",
+                        "success": success
+                    }))
+
+                # ── LED Control (Living Room) ──────────────────────────────────────
+                elif msg_stripped == "LED_TOGGLE":
+                    success = await led_toggle()
+                    status = await led_get_status()
+                    await websocket.send(json.dumps({
+                        "type": "led_toggle_result",
+                        "success": success,
+                        "state": status
+                    }))
+                elif msg_stripped.startswith("LED_COLOR:"):
+                    try:
+                        parts = msg_stripped.split(":")
+                        color_x = int(parts[1])
+                        color_y = int(parts[2])
+                        success = await led_set_color(color_x, color_y)
+                        status = await led_get_status()
+                        await websocket.send(json.dumps({
+                            "type": "led_color_result",
+                            "success": success,
+                            "color_x": color_x,
+                            "color_y": color_y,
+                            "state": status
+                        }))
+                    except (IndexError, ValueError):
+                        await websocket.send(json.dumps({
+                            "type": "led_color_result",
+                            "success": False,
+                            "error": "Invalid format. Use LED_COLOR:x:y"
+                        }))
+                elif msg_stripped.startswith("LED_BRIGHTNESS:"):
+                    try:
+                        level = int(msg_stripped.split(":")[1])
+                        success = await led_set_brightness(level)
+                        status = await led_get_status()
+                        await websocket.send(json.dumps({
+                            "type": "led_brightness_result",
+                            "success": success,
+                            "brightness": level,
+                            "state": status
+                        }))
+                    except (IndexError, ValueError):
+                        await websocket.send(json.dumps({
+                            "type": "led_brightness_result",
+                            "success": False,
+                            "error": "Invalid format. Use LED_BRIGHTNESS:level"
+                        }))
+                elif msg_stripped == "LED_STATUS":
+                    status = await led_get_status()
+                    await websocket.send(json.dumps({
+                        "type": "led_status",
+                        "state": status
+                    }))
+
             elif isinstance(message, bytes):
                 msg_bytes = message.strip()
 
@@ -567,6 +1038,26 @@ async def handle_client(websocket):
                         asyncio.ensure_future(
                             process_audio(websocket, session_id, snapshot, use_zeroclaw)
                         )
+
+                elif msg_bytes.startswith(b"LED_TOGGLE"):
+                    asyncio.ensure_future(led_toggle())
+                elif msg_bytes.startswith(b"LED_COLOR:"):
+                    parts = msg_bytes.decode().split(":")
+                    if len(parts) >= 3:
+                        try:
+                            color_x = int(parts[1])
+                            color_y = int(parts[2])
+                            asyncio.ensure_future(led_set_color(color_x, color_y))
+                        except ValueError:
+                            pass
+                elif msg_bytes.startswith(b"LED_BRIGHTNESS:"):
+                    parts = msg_bytes.decode().split(":")
+                    if len(parts) >= 2:
+                        try:
+                            level = int(parts[1])
+                            asyncio.ensure_future(led_set_brightness(level))
+                        except ValueError:
+                            pass
 
                 elif len(message) == 4 and expected_audio_len == 0:
                     size = struct.unpack('>I', message)[0]
@@ -592,6 +1083,9 @@ async def handle_client(websocket):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
+    # Spotify token'ı başlat
+    await refresh_spotify_token()
+
     # ZeroClaw modu kullaniliyorsa MiniMax gerekli degil
     if USE_ZEROCLAW:
         print("=" * 60)
@@ -612,16 +1106,24 @@ async def main():
             print(f"ERROR: GEMINI_API_KEY not set (required for TTS_BACKEND={TTS_BACKEND})!"); return
 
         print("=" * 60)
-        print("  Voice Assistant Server v2.2 (MiniMax Mode)")
+        print("  Voice Assistant Server v2.3 (MiniMax Mode)")
         print("=" * 60)
         print("  STT: whisper.cpp server (local)")
         print("  LLM: MiniMax-M2.7")
-        print(f"  TTS: {TTS_BACKEND}")
+        print("  TTS: MiniMax speech-2.8-hd (Turkish_CalmWoman)")
         print("  Session: IP-based (reconnect-safe)")
         print("  ws://0.0.0.0:8765")
         print("=" * 60)
 
-    async with websockets.serve(handle_client, "0.0.0.0", 8765):
+    print("[WS] Starting WebSocket server on 0.0.0.0:8765 ...")
+    try:
+        server = await websockets.serve(handle_client, "0.0.0.0", 8765)
+        print(f"[WS] WebSocket server STARTED: {server.sockets[0].getsockname() if server.sockets else 'no sockets'}")
+    except Exception as e:
+        print(f"[WS] ERROR starting server: {type(e).__name__}: {e}")
+        raise
+    async with server:
+        print("[WS] Server is now accepting connections")
         await asyncio.Future()
 
 
