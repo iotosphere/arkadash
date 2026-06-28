@@ -8,6 +8,7 @@
 #include "esp_websocket_client.h"
 #include "esp_event.h"
 #include "esp_timer.h"
+#include "ai_hal9000.h"
 
 static const char *TAG = "ws_client";
 
@@ -124,6 +125,8 @@ static void websocket_event_handler(void *handler_args,
                 ws_clear_response();
                 s_waiting_for_response = true;
                 s_tts_complete         = false;
+                /* HAL 9000 göz animasyonu: AI konuşmaya başladı */
+                ai_hal9000_start();
             }
             else if (strstr(json_buf, "tts_end")) {
                 s_expected_size = 0;
@@ -138,17 +141,22 @@ static void websocket_event_handler(void *handler_args,
                 s_tts_complete = true;
                 /* s_waiting_for_response'u burada sıfırlama —
                    binary chunk'lar hâlâ gelebilir. chat_task sıfırlar. */
+                /* HAL 9000: AI konuşması bitti (binary chunk'lar hâlâ gelebilir ama
+                   tts_end server tarafında ses üretiminin bittiği anlamına gelir). */
+                ai_hal9000_stop();
             }
             else if (strstr(json_buf, "done")) {
                 /* Tüm veri akışı tamamlandı - ring buffer boşalana kadar bekle */
                 ESP_LOGI(TAG, "done - all data sent");
                 s_tts_complete = true;
+                ai_hal9000_stop();  /* yedek: tts_end kaçırılırsa burada dur */
             }
 else if (strstr(json_buf, "error")) {
                 ESP_LOGW(TAG, "Server error - invalidating ring buffer");
                 s_waiting_for_response = false;
                 s_has_error = true;
                 drain_ring_buffer();
+                ai_hal9000_stop();  /* hata durumunda da durdur */
             }
 else if (strstr(json_buf, "spotify_playlists")) {
                 ESP_LOGI(TAG, "spotify_playlists received");

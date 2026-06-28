@@ -902,25 +902,10 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
 
 /* ----------------------------------------------------------------------- */
 
-/* HAL 9000 geçici test toggle task'i (her 8s start/stop).
- * İleride chat_task WS event'lerinden ai_hal9000_start()/stop() ile
- * değiştirilecek (AI konuşmaya başlayınca start, susunca stop).
- * Bu task'i silmek için bu bloğu + alttaki xTaskCreate'i kaldır. */
-static void hal9000_test_task(void *pv) {
-  (void)pv;
-  bool active = false;
-  while (1) {
-    vTaskDelay(pdMS_TO_TICKS(8000));
-    if (active) {
-      ai_hal9000_stop();
-    } else {
-      ai_hal9000_start();
-    }
-    active = !active;
-  }
-}
-
-static void display_task(void *pv) {
+/* HAL 9000 artık websocket_client.c tarafından WS event'lerine bağlı:
+ *   tts_start → ai_hal9000_start()  (AI konuşmaya başladı)
+ *   tts_end   → ai_hal9000_stop()   (AI sustu)
+ * Geçici 8s toggle test task'i kaldırıldı. */static void display_task(void *pv) {
   (void)pv;
 
   lv_indev_set_read_cb(encoder_indev, encoder_read);
@@ -1160,12 +1145,10 @@ void app_main(void) {
   xTaskCreate(chat_task, "chat_task", 16384, NULL, 4, NULL);
   // Pin display_task to CPU0 so it runs on same core as LVGL task
   xTaskCreatePinnedToCore(display_task, "display_task", 16384, NULL, 5, NULL,
-                          0);
+                           0);
 
-  /* Geçici: HAL 9000 animasyonunu 8 saniyede bir toggle et, böylece
-   * assistant ekranına gidince gözün pulse + ring rotate ettiğini görebilirsin.
-   * İleride bu satırı kaldır, chat_task içinden WS event ile çağır. */
-  xTaskCreate(hal9000_test_task, "hal9000_test", 4096, NULL, 1, NULL);
+  /* HAL 9000 animasyonu websocket_client.c içinde WS event'lerine bağlı:
+   * tts_start → start, tts_end → stop. Ek task gerekmez. */
 
   ESP_LOGI(TAG, "========== Ready ==========");
   while (1)
