@@ -1,3 +1,4 @@
+#include "ai_hal9000.h"
 #include "app_config.h"
 #include "audio.h"
 #include "bricks_breaker.h"
@@ -13,7 +14,6 @@
 #include "lvgl.h"
 #include "nvs_flash.h"
 #include "screens.h"
-#include "ai_hal9000.h"
 #include "ui.h"
 
 /* ============================================================================
@@ -28,70 +28,70 @@
  * insert_free_block merge recursion'ı 5+ sn sürüyor, watchdog ateşleniyordu.
  * PSRAM 32 MB — fragmentation imkânsız, draw_buf için yer bol.
  *
- * Trade-off: PSRAM internal RAM'den yavaş (50-80 ns vs 10 ns), ama heap_caps_malloc
- * fast path'inde kalındığı sürece overhead ihmal edilebilir (~%1-2 CPU).
- * ============================================================================ */
-#include <stdlib.h>
+ * Trade-off: PSRAM internal RAM'den yavaş (50-80 ns vs 10 ns), ama
+ * heap_caps_malloc fast path'inde kalındığı sürece overhead ihmal edilebilir
+ * (~%1-2 CPU).
+ * ============================================================================
+ */
 #include "esp_heap_caps.h"
+#include <stdlib.h>
 /* lv_mem.h LVGL internal path'inde, public API lvgl.h üzerinden expose.
  * (lvgl.h zaten lv_mem.h'ı internal include ediyor.) */
 
-void lv_mem_init(void) {
-    /* Nothing to init — heap_caps handles PSRAM heap */
-}
+void lv_mem_init(void) { /* Nothing to init — heap_caps handles PSRAM heap */ }
 
-void lv_mem_deinit(void) {
-    /* Nothing to deinit */
-}
+void lv_mem_deinit(void) { /* Nothing to deinit */ }
 
 void *lv_malloc_core(size_t size) {
-    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 void *lv_realloc_core(void *p, size_t new_size) {
-    return heap_caps_realloc(p, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return heap_caps_realloc(p, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
-void lv_free_core(void *p) {
-    heap_caps_free(p);
-}
+void lv_free_core(void *p) { heap_caps_free(p); }
 
 lv_mem_pool_t lv_mem_add_pool(void *mem, size_t bytes) {
-    /* Custom mode: pool management not supported */
-    LV_UNUSED(mem);
-    LV_UNUSED(bytes);
-    return NULL;
+  /* Custom mode: pool management not supported */
+  LV_UNUSED(mem);
+  LV_UNUSED(bytes);
+  return NULL;
 }
 
-void lv_mem_remove_pool(lv_mem_pool_t pool) {
-    LV_UNUSED(pool);
-}
+void lv_mem_remove_pool(lv_mem_pool_t pool) { LV_UNUSED(pool); }
 
 void lv_mem_monitor_core(lv_mem_monitor_t *mon_p) {
-    /* heap_caps_get_minimum_free_size ile PSRAM izleme — fragmentation rapor edilmez
-     * (PSRAM ayrı heap, LVGL'nin internal allocator görmüyor). Yaklaşık değerler. */
-    if (!mon_p) return;
-    mon_p->total_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    mon_p->free_size  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    mon_p->free_biggest_size = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
-    mon_p->used_cnt = 0;
-    mon_p->free_cnt = 0;
-    mon_p->max_used = 0;
-    mon_p->used_pct = (mon_p->total_size > 0)
-        ? (uint8_t)((mon_p->total_size - mon_p->free_size) * 100 / mon_p->total_size)
-        : 0;
-    mon_p->frag_pct = 0;  /* heap_caps fragmentation bilinmiyor */
+  /* heap_caps_get_minimum_free_size ile PSRAM izleme — fragmentation rapor
+   * edilmez (PSRAM ayrı heap, LVGL'nin internal allocator görmüyor). Yaklaşık
+   * değerler. */
+  if (!mon_p)
+    return;
+  mon_p->total_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  mon_p->free_size = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  mon_p->free_biggest_size =
+      heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  mon_p->used_cnt = 0;
+  mon_p->free_cnt = 0;
+  mon_p->max_used = 0;
+  mon_p->used_pct = (mon_p->total_size > 0)
+                        ? (uint8_t)((mon_p->total_size - mon_p->free_size) *
+                                    100 / mon_p->total_size)
+                        : 0;
+  mon_p->frag_pct = 0; /* heap_caps fragmentation bilinmiyor */
 }
 
 lv_result_t lv_mem_test_core(void) {
-    /* Basit sanity: küçük bir block allocate edip free et. */
-    void *p = heap_caps_malloc(64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) return LV_RESULT_INVALID;
-    heap_caps_free(p);
-    return LV_RESULT_OK;
+  /* Basit sanity: küçük bir block allocate edip free et. */
+  void *p = heap_caps_malloc(64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p)
+    return LV_RESULT_INVALID;
+  heap_caps_free(p);
+  return LV_RESULT_OK;
 }
 
-/* ============================================================================ */
+/* ============================================================================
+ */
 #include "websocket_client.h"
 #include "wifi_station.h"
 #include <stdio.h>
@@ -103,7 +103,7 @@ static const char *TAG = "app_main";
 #define LONG_PRESS_MS 800u
 #define SLEEP_TIMEOUT_MS 90000u /* 1.5 dk */
 #define REC_BUF_SIZE (16000 * 2 * 5)
-#define VOICE_SERVER_URI "ws://192.168.1.19:8765"
+#define VOICE_SERVER_URI "ws://192.168.1.6:8765"
 
 static bool is_recording = false;
 static bool is_ai_speaking = false;
@@ -460,9 +460,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
   /* DEBUG: log every PUSH edge so we can confirm the encoder button
    * is actually toggling when the user presses it. */
   if (pushed != last_pushed_dbg) {
-    ESP_LOGI("enc", "PUSH %s (cur=%p sleep=%d)",
-             pushed ? "PRESS" : "RELEASE", (void *)cur,
-             display_sleeping ? 1 : 0);
+    ESP_LOGI("enc", "PUSH %s (cur=%p sleep=%d)", pushed ? "PRESS" : "RELEASE",
+             (void *)cur, display_sleeping ? 1 : 0);
     last_pushed_dbg = pushed;
   }
 
@@ -518,15 +517,17 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     if (cur == objects.games) {
       data->enc_diff = 0;
     } else {
-      /* Encoder bounce / hardware gürültü koruması: 20ms içinde yeni event gelirse
-       * enc_diff'i tek adıma sınırla (yoksa LVGL grup sürekli cycle eder). */
+      /* Encoder bounce / hardware gürültü koruması: 20ms içinde yeni event
+       * gelirse enc_diff'i tek adıma sınırla (yoksa LVGL grup sürekli cycle
+       * eder). */
       static uint32_t last_enc_event_ms = 0;
       uint32_t now = lv_tick_get();
       if (diff != 0 && last_enc_event_ms != 0 &&
           (now - last_enc_event_ms) < 20) {
-        diff = (diff > 0) ? 1 : -1;  /* clamp to single step */
+        diff = (diff > 0) ? 1 : -1; /* clamp to single step */
       }
-      if (diff != 0) last_enc_event_ms = now;
+      if (diff != 0)
+        last_enc_event_ms = now;
       data->enc_diff = diff;
     }
   } else {
@@ -580,7 +581,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     }
   }
 
-  /* Info ekranı: encoder info grubuna geçsin (boş, sadece SCREEN_LOADED footer). */
+  /* Info ekranı: encoder info grubuna geçsin (boş, sadece SCREEN_LOADED
+   * footer). */
   if (cur == objects.about) {
     if (lv_indev_get_group(encoder_indev) != group_info) {
       lv_indev_set_group(encoder_indev, group_info);
@@ -600,18 +602,18 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
         return;
       }
       if (!push_handled) {
-        push_handled  = true;
+        push_handled = true;
         push_start_ms = lv_tick_get();
         ESP_LOGI("sh", "PUSH pressed (state=PR, no key on press)");
       }
       if (lv_tick_get() - push_start_ms >= LONG_PRESS_MS) {
         long_press_triggered = true;
-        pending_menu_load    = true;
-        menu_just_loaded     = true;
-        push_handled         = false;
-        data->state          = LV_INDEV_STATE_REL;
-        data->key            = 0;
-        data->enc_diff       = 0;
+        pending_menu_load = true;
+        menu_just_loaded = true;
+        push_handled = false;
+        data->state = LV_INDEV_STATE_REL;
+        data->key = 0;
+        data->enc_diff = 0;
         ESP_LOGI("sh", "LONG_PRESS -> pending_menu_load");
         return;
       }
@@ -622,7 +624,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
         /* Short press: send key=ENTER on RELEASE so LVGL fires CLICKED.
          * (Sending key on PRESS made click event unreliable here.) */
         data->key = LV_KEY_ENTER;
-        ESP_LOGI("sh", "PUSH released (short press, key=ENTER on REL, dur=%lums)",
+        ESP_LOGI("sh",
+                 "PUSH released (short press, key=ENTER on REL, dur=%lums)",
                  (unsigned long)(lv_tick_get() - push_start_ms));
       } else {
         data->key = 0;
@@ -630,9 +633,9 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
       if (menu_just_loaded) {
         menu_just_loaded = false;
       }
-      push_handled         = false;
+      push_handled = false;
       long_press_triggered = false;
-      data->state          = LV_INDEV_STATE_REL;
+      data->state = LV_INDEV_STATE_REL;
     }
     return;
   }
@@ -905,7 +908,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
 /* HAL 9000 artık websocket_client.c tarafından WS event'lerine bağlı:
  *   tts_start → ai_hal9000_start()  (AI konuşmaya başladı)
  *   tts_end   → ai_hal9000_stop()   (AI sustu)
- * Geçici 8s toggle test task'i kaldırıldı. */static void display_task(void *pv) {
+ * Geçici 8s toggle test task'i kaldırıldı. */
+static void display_task(void *pv) {
   (void)pv;
 
   lv_indev_set_read_cb(encoder_indev, encoder_read);
@@ -919,7 +923,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     if (objects.aivoice) {
       ai_hal9000_create(objects.aivoice);
     }
-    /* Smart Home buton callback'leri screens.c tarafından bağlı (çift kayıt yapma). */
+    /* Smart Home buton callback'leri screens.c tarafından bağlı (çift kayıt
+     * yapma). */
     /* Settings page: hook the Provision button. The page also has
      * volume and brightness sliders whose initial value is set by
      * eez_wrapper.cpp (ui_set_volume / ui_set_brightness).
@@ -944,8 +949,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 
   /* Assistant group: encoder sadece assistant ekranındayken bu gruba geçer.
-   * İçinde sadece assistant ekranındaki focusable objeler var (mic, ai_anim vs.),
-   * böylece encoder menu butonlarına (Music/Smart Home/Games) kaçmaz. */
+   * İçinde sadece assistant ekranındaki focusable objeler var (mic, ai_anim
+   * vs.), böylece encoder menu butonlarına (Music/Smart Home/Games) kaçmaz. */
   group_assistant = lv_group_create();
   lv_group_set_default(group_assistant);
   if (objects.assistant) {
@@ -954,7 +959,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
     lv_group_add_obj(group_assistant, objects.assistant);
   }
   if (objects.mic) {
-    /* mic (lv_image) default clickable değil — encoder'ın focus edebilmesi için flag ekle */
+    /* mic (lv_image) default clickable değil — encoder'ın focus edebilmesi için
+     * flag ekle */
     lv_obj_add_flag(objects.mic, LV_OBJ_FLAG_CLICKABLE);
     lv_group_add_obj(group_assistant, objects.mic);
   }
@@ -1043,8 +1049,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data) {
         if (idle >= SLEEP_TIMEOUT_MS) {
           display_backlight_off();
           display_sleeping = true;
-          /* Not: encoder tamamen devre dışı BIRAKILMAZ (push wake_up için gerekli).
-           * encoder_read() callback'i display_sleeping=true olduğunda
+          /* Not: encoder tamamen devre dışı BIRAKILMAZ (push wake_up için
+           * gerekli). encoder_read() callback'i display_sleeping=true olduğunda
            * enc_diff=0 ve REL döndürür → LVGL grup focus değişmez. */
           ESP_LOGI(TAG, "Display sleep");
         }
@@ -1088,11 +1094,13 @@ void app_main(void) {
   ESP_LOGI(TAG, "LVGL...");
   const lvgl_port_cfg_t lcfg = ESP_LVGL_PORT_INIT_CONFIG();
   ESP_ERROR_CHECK(lvgl_port_init(&lcfg));
-  /* LVGL_PSRAM_FORCE: CONFIG_LV_USE_CUSTOM_MALLOC=y seçildi — lv_malloc_core/free_core/
-   * realloc_core aşağıda tanımlandı, heap_caps SPIRAM'e yönlendiriyor.
-   * (LVGL 9.5'te builtin malloc 64 KB internal RAM TLSF havuzu, HAL 9000 widget'ları
-   * + animasyonlar fragment edip insert_free_block merge recursion 5+ sn sürüyordu —
-   * watchdog tetikleniyordu. PSRAM 32 MB, fragmentation imkansız.) */
+  /* LVGL_PSRAM_FORCE: CONFIG_LV_USE_CUSTOM_MALLOC=y seçildi —
+   * lv_malloc_core/free_core/ realloc_core aşağıda tanımlandı, heap_caps
+   * SPIRAM'e yönlendiriyor. (LVGL 9.5'te builtin malloc 64 KB internal RAM TLSF
+   * havuzu, HAL 9000 widget'ları
+   * + animasyonlar fragment edip insert_free_block merge recursion 5+ sn
+   * sürüyordu — watchdog tetikleniyordu. PSRAM 32 MB, fragmentation imkansız.)
+   */
 
   const lvgl_port_display_cfg_t dcfg = {
       .io_handle = display_get_io_handle(),
@@ -1145,7 +1153,7 @@ void app_main(void) {
   xTaskCreate(chat_task, "chat_task", 16384, NULL, 4, NULL);
   // Pin display_task to CPU0 so it runs on same core as LVGL task
   xTaskCreatePinnedToCore(display_task, "display_task", 16384, NULL, 5, NULL,
-                           0);
+                          0);
 
   /* HAL 9000 animasyonu websocket_client.c içinde WS event'lerine bağlı:
    * tts_start → start, tts_end → stop. Ek task gerekmez. */

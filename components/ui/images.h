@@ -37,7 +37,6 @@ extern const lv_img_dsc_t img_umbrella;
 extern const lv_img_dsc_t img_therm;
 extern const lv_img_dsc_t img_hum;
 extern const lv_img_dsc_t img_ai_asistant;
-extern const lv_img_dsc_t img_aianim;
 extern const lv_img_dsc_t img_microphone;
 extern const lv_img_dsc_t img_record_button;
 extern const lv_img_dsc_t img_infopic;

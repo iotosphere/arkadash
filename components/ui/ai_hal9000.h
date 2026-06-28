@@ -12,13 +12,13 @@ void ai_hal9000_create(lv_obj_t *parent);
 
 /**
  * Animasyonu başlatır (AI konuşmaya başladığında).
- * Eye pulse + ring rotation + reflect pulse başlar.
+ * GIF widget görünür olur, internal timer zaten otomatik oynatır.
  */
 void ai_hal9000_start(void);
 
 /**
  * Animasyonu durdurur (AI sustuğunda).
- * Tüm lv_anim'leri siler, container'ı gizler.
+ * Container gizlenir (GIF timer arka planda çalışmaya devam eder ama render edilmez).
  */
 void ai_hal9000_stop(void);
 

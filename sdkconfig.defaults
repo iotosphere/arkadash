@@ -16,3 +16,7 @@ CONFIG_LV_USE_CUSTOM_MALLOC=y
 # LVGL draw buffer refresh period: 50ms (20 FPS) — HAL 9000 animasyonu için yeterli,
 # daha az CPU yükü, watchdog'a karşı tolerans. (Asıl isim LV_DEF_REFR_PERIOD.)
 CONFIG_LV_DEF_REFR_PERIOD=50
+
+# HAL 9000 animated GIF için GIF decoder açık (lv_gif widget).
+# APNG LVGL'de yok, GIF aynı işi görüyor (76 frame × 30ms = 2.3s döngü).
+CONFIG_LV_USE_GIF=y
