@@ -9,8 +9,15 @@
 #include "esp_wifi_remote.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "wifi_station";
+
+/* init() sırasında bağlantı için bekleme timeout (ms).
+ * 15s içinde bağlanamazsa provisioning mode'a düş. */
+#define WIFI_CONNECT_TIMEOUT_MS  15000
 
 static EventGroupHandle_t s_wifi_event_group = NULL;
 static bool s_connected = false;
@@ -94,9 +101,13 @@ esp_err_t wifi_station_init(const wifi_station_config_t *config)
 
     ESP_LOGI(TAG, "WiFi başlatıldı");
 
+    /* 15 saniye içinde bağlanamazsa FAIL — provisioning mode'a geçiş için.
+     * (Sonsuz portMAX_DELAY yerine sınırlı timeout — main.c buna göre
+     * fallback stratejisi çalıştırır.) */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE, portMAX_DELAY);
+                                            pdFALSE, pdFALSE,
+                                            pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "✓ WiFi'ye bağlandı!");
@@ -133,4 +144,129 @@ esp_err_t wifi_station_deinit(void)
         s_wifi_event_group = NULL;
     }
     return ret;
+}
+
+/* ===================================================================
+ * NVS credential storage — 2026-06-29
+ *
+ * Kullanıcı ilk açılışta (veya "WiFi Sıfırla" sonrası) credential girer
+ * (SoftAP provisioning akışında veya hardcoded fallback). Bu fonksiyonlar
+ * NVS flash partition'a kalıcı yazar, sonraki bootlarda oradan okunur.
+ * Böylece firmware'de hardcoded SSID/PASS olmasına gerek kalmaz.
+ *
+ * NVS namespace: "wifi_cred"
+ * Keys: "ssid" (≤32 byte), "pass" (≤64 byte, NULL = açık ağ)
+ * =================================================================== */
+
+esp_err_t wifi_cred_save(const char *ssid, const char *password)
+{
+    if (!ssid || strlen(ssid) == 0 || strlen(ssid) >= WIFI_SSID_MAX_LEN) {
+        ESP_LOGE(TAG, "wifi_cred_save: invalid ssid (len=%u)",
+                 ssid ? (unsigned)strlen(ssid) : 0);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(h, WIFI_NVS_KEY_SSID, ssid);
+    if (err == ESP_OK && password) {
+        err = nvs_set_str(h, WIFI_NVS_KEY_PASS, password);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi cred saved: ssid='%s' (pass len=%u)",
+                 ssid, password ? (unsigned)strlen(password) : 0);
+    } else {
+        ESP_LOGE(TAG, "wifi_cred_save failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t wifi_cred_load(char *ssid_out, size_t ssid_len,
+                          char *pass_out, size_t pass_len)
+{
+    if (!ssid_out || !pass_out || ssid_len < WIFI_SSID_MAX_LEN ||
+        pass_len < WIFI_PASS_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        /* NOT_FOUND normal — ilk açılışta beklenir */
+        return err;
+    }
+
+    /* SSID oku */
+    size_t required = ssid_len;
+    err = nvs_get_str(h, WIFI_NVS_KEY_SSID, ssid_out, &required);
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+
+    /* Password opsiyonel — açık ağlar için */
+    required = pass_len;
+    err = nvs_get_str(h, WIFI_NVS_KEY_PASS, pass_out, &required);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* Şifre kaydedilmemiş → açık ağ */
+        pass_out[0] = '\0';
+        err = ESP_OK;
+    }
+
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t wifi_cred_clear(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(WIFI_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "WiFi creds wiped (factory reset)");
+    }
+    return err;
+}
+
+bool wifi_cred_exists(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    size_t len = 0;
+    bool has = (nvs_get_str(h, WIFI_NVS_KEY_SSID, NULL, &len) == ESP_OK && len > 1);
+    nvs_close(h);
+    return has;
+}
+
+void wifi_reset_and_reboot(void)
+{
+    ESP_LOGW(TAG, "WiFi reset: NVS wiped, restarting...");
+    esp_err_t err = wifi_cred_clear();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_cred_clear failed: %s", esp_err_to_name(err));
+    }
+    /* NVS commit + log flush için kısa bekleme */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
 }

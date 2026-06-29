@@ -16,6 +16,8 @@
 #include "nvs_flash.h"
 #include "screens.h"
 #include "ui.h"
+#include "wifi_station.h"
+#include "wifi_provisioning.h"
 
 /* ============================================================================
  * LVGL PSRAM custom allocator (lv_malloc_core / lv_free_core / lv_realloc_core)
@@ -99,8 +101,20 @@ lv_result_t lv_mem_test_core(void) {
 
 static const char *TAG = "app_main";
 
-#define WIFI_SSID "SUPERONLINE_WiFi_5292"
-#define WIFI_PASS "EJPus6hfjy7z"
+/* ==== WiFi credentials (fabrika fallback'ı) ====
+ *
+ * İlk açılışta NVS boş → factory_default kullanılır (bu değerler).
+ * İlk başarılı provisioning sonrası NVS yazılır, sonraki bootlarda oradan okunur.
+ * Settings ekranındaki "WiFi Sıfırla" → NVS silinir, factory_default'a geri dönülür.
+ *
+ * Production'da bu değerleri KULLANMIYOR olmak gerek (her cihaz kendi WiFi'si ile gelmeli).
+ * Bu sadece development/factory fallback. */
+#define WIFI_FACTORY_SSID  "SUPERONLINE_WiFi_5292"
+#define WIFI_FACTORY_PASS  "EJPus6hfjy7z"
+
+/* WiFi bağlantı denemesi timeout — başarısızsa provisioning mode'a geç */
+#define WIFI_CONNECT_TIMEOUT_MS  15000
+
 #define LONG_PRESS_MS 800u
 #define SLEEP_TIMEOUT_MS 90000u /* 1.5 dk */
 #define REC_BUF_SIZE (16000 * 2 * 5)
@@ -160,13 +174,15 @@ static void activity_reset(void) {
 /* Smart Home buton callback'leri screens.c:200+'da tanımlı (LVGL generated).
  * Çift kayıt YAPMA — yoksa buton click 2 kez tetiklenir (PR+CLICKED). */
 
-/* o-provision screen: button on settings page triggers this. */
+/* Settings ekranındaki "Wifi Provisioning" butonu —
+ * kayıtlı WiFi credential'ı siler + restart eder.
+ * Restart sonrası NVS boş → main.c wifi_provisioning_start() otomatik çağrılır
+ * → SoftAP açılır → kullanıcı telefondan form doldurur. */
 static void settings_provision_cb(lv_event_t *e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    ESP_LOGI(TAG, "Provision screen open");
-    if (objects.provision) {
-      lv_scr_load(objects.provision);
-    }
+    ESP_LOGW(TAG, "Settings → Wifi Provisioning basıldı, NVS siliniyor...");
+    wifi_reset_and_reboot();
+    /* buraya asla gelmez, esp_restart yaptı */
   }
 }
 
@@ -1161,9 +1177,46 @@ void app_main(void) {
     lv_group_add_obj(group_games, objects.bricks_btn);
   /* group_info boş (ekranda focusable obje yok). */
 
-  wifi_station_config_t wc = {
-      .ssid = WIFI_SSID, .password = WIFI_PASS, .max_retry = 5};
-  wifi_station_init(&wc);
+  /* ==== WiFi bağlantısı — NVS önce, fallback factory, son çare provisioning ====
+   * 1. NVS'te kayıtlı SSID varsa → onu kullan
+   * 2. Yoksa → factory_default (WIFI_FACTORY_*) kullan
+   * 3. Init 15s içinde bağlanamazsa → provisioning mode aç (SoftAP + HTTP form)
+   * 4. Settings → "WiFi Sıfırla" → wifi_reset_and_reboot() çağrılır */
+  {
+      char nvs_ssid[WIFI_SSID_MAX_LEN] = {0};
+      char nvs_pass[WIFI_PASS_MAX_LEN] = {0};
+      const char *use_ssid = NULL;
+      const char *use_pass = NULL;
+
+      if (wifi_cred_load(nvs_ssid, sizeof(nvs_ssid),
+                          nvs_pass, sizeof(nvs_pass)) == ESP_OK) {
+          ESP_LOGI(TAG, "WiFi: NVS'ten yüklendi — ssid='%s'", nvs_ssid);
+          use_ssid = nvs_ssid;
+          use_pass = nvs_pass;
+      } else {
+          ESP_LOGW(TAG, "WiFi: NVS boş, factory default kullanılıyor: %s",
+                   WIFI_FACTORY_SSID);
+          use_ssid = WIFI_FACTORY_SSID;
+          use_pass = WIFI_FACTORY_PASS;
+      }
+
+      wifi_station_config_t wc = {
+          .ssid = use_ssid,
+          .password = use_pass,
+          .max_retry = 3,
+      };
+      esp_err_t wifi_err = wifi_station_init(&wc);
+
+      if (wifi_err != ESP_OK) {
+          ESP_LOGW(TAG, "WiFi bağlantısı başarısız (%s), provisioning moduna geçiliyor",
+                   esp_err_to_name(wifi_err));
+          wifi_provisioning_start();
+          /* Provisioning başladı, ekranda kullanıcıya göster:
+           * — Telefonla bağlan, 192.168.4.1 aç, form doldur. */
+          ui_set_footer("WiFi: telefona 192.168.4.1");
+          return;  /* chat/audio vs başlatma, restart bekleniyor */
+      }
+  }
 
   clock_weather_init();
 
