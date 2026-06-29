@@ -175,14 +175,39 @@ static void activity_reset(void) {
  * Çift kayıt YAPMA — yoksa buton click 2 kez tetiklenir (PR+CLICKED). */
 
 /* Settings ekranındaki "Wifi Provisioning" butonu —
- * kayıtlı WiFi credential'ı siler + restart eder.
- * Restart sonrası NVS boş → main.c wifi_provisioning_start() otomatik çağrılır
- * → SoftAP açılır → kullanıcı telefondan form doldurur. */
+ * Mevcut STA bağlantısını kesip SoftAP moduna geçer (telefondan form doldurmak için).
+ * Restart YOK, telefon HEMEN bağlanabilir.
+ *
+ * Akış:
+ *   1. wifi_station_disconnect() — STA bağlantısı kopar (varsa)
+ *   2. wifi_provisioning_start()  — SoftAP "Arkadash-Setup" + HTTP :80 açılır
+ *   3. Telefon bu ağa bağlanır → 192.168.4.1 form → submit
+ *   4. wifi_provisioning.c POST handler NVS'e yazar + esp_restart()
+ *   5. Reboot sonrası NVS'teki yeni SSID/pass ile normal bağlantı */
 static void settings_provision_cb(lv_event_t *e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-    ESP_LOGW(TAG, "Settings → Wifi Provisioning basıldı, NVS siliniyor...");
-    wifi_reset_and_reboot();
-    /* buraya asla gelmez, esp_restart yaptı */
+    ESP_LOGW(TAG, "Settings → Wifi Provisioning: STA kopar, SoftAP başlatılıyor");
+
+    /* STA bağlantısını kopar (varsa). Bağlı değilse ESP_OK döner. */
+    esp_err_t dr = wifi_station_disconnect();
+    if (dr != ESP_OK && dr != ESP_ERR_INVALID_STATE) {
+      ESP_LOGW(TAG, "wifi_station_disconnect: %s", esp_err_to_name(dr));
+    }
+
+    /* SoftAP modunu aç + HTTP form server başlat. */
+    esp_err_t pr = wifi_provisioning_start();
+    if (pr != ESP_OK) {
+      ESP_LOGE(TAG, "wifi_provisioning_start başarısız: %s",
+               esp_err_to_name(pr));
+      return;
+    }
+
+    /* Assistant ekranına dön, kullanıcıya telefona bağlanması için mesaj göster */
+    if (objects.assistant) {
+      lv_scr_load(objects.assistant);
+    }
+    ui_set_footer("WiFi: telefona 192.168.4.1");
+    ESP_LOGI(TAG, "Provision modu aktif. Telefonu 'Arkadash-Setup' ağına bağla, 192.168.4.1'i aç.");
   }
 }
 

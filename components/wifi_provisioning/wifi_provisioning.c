@@ -222,9 +222,26 @@ static esp_err_t start_http_server(void)
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){
         .uri = "/submit", .method = HTTP_POST, .handler = submit_post_handler
     });
+    /* Captive portal detection — iOS/Android otomatik browser açar.
+     * iOS: /hotspot-detect.html bekler, status 200 olursa "kontrol başarılı"
+     *   (redirect dönerse captive var → browser açılır)
+     * Android 9+: /generate_204 bekler, status 204 = "captive yok",
+     *   başka şey dönerse captive var → browser açılır */
     httpd_register_uri_handler(s_httpd, &(httpd_uri_t){
         .uri = "/generate_204", .method = HTTP_GET,
-        .handler = redirect_get_handler  /* Android captive portal detection */
+        .handler = redirect_get_handler
+    });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){
+        .uri = "/hotspot-detect.html", .method = HTTP_GET,
+        .handler = redirect_get_handler
+    });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){
+        .uri = "/connectivitycheck.html", .method = HTTP_GET,
+        .handler = redirect_get_handler
+    });
+    httpd_register_uri_handler(s_httpd, &(httpd_uri_t){
+        .uri = "/success.txt", .method = HTTP_GET,  /* BlackBerry fallback */
+        .handler = redirect_get_handler
     });
 
     ESP_LOGI(TAG, "HTTP server started (port 80)");
@@ -258,44 +275,52 @@ static void dns_server_task(void *arg)
 
     uint8_t buf[256];
     while (1) {
-        int n = recv(sock, buf, sizeof(buf), 0);
-        if (n < 12) continue;  /* too short, skip */
-
-        /* DNS response: soruya cevap olarak A record 192.168.4.1 ekle */
-        /* Transaction ID'yi aynen kopyala (ilk 2 byte) */
-        memcpy(buf + 2, "\x81\x80", 2);  /* Response, No error */
-        /* Questions: 1, Answer RRs: 1, Authority/Additional: 0 */
-        buf[6] = 0; buf[7] = 0;  /* Authority */
-        buf[8] = 0; buf[9] = 0;  /* Additional */
-
-        /* Answer RR: name pointer (0xC00C) + type A (1) + class IN (1)
-         * + TTL (60s) + RDLENGTH (4) + RDATA (192.168.4.1) */
-        size_t resp_len = n;
-        if (resp_len + 16 <= sizeof(buf)) {
-            buf[resp_len++] = 0xC0; buf[resp_len++] = 0x0C;
-            buf[resp_len++] = 0x00; buf[resp_len++] = 0x01;  /* Type A */
-            buf[resp_len++] = 0x00; buf[resp_len++] = 0x01;  /* Class IN */
-            buf[resp_len++] = 0x00; buf[resp_len++] = 0x00;
-            buf[resp_len++] = 0x00; buf[resp_len++] = 0x3C;  /* TTL 60 */
-            buf[resp_len++] = 0x00; buf[resp_len++] = 0x04;  /* RDLEN 4 */
-            buf[resp_len++] = 192; buf[resp_len++] = 168;
-            buf[resp_len++] = 4;   buf[resp_len++] = 1;
-        } else {
-            continue;
-        }
-
-        /* Client adresine gönder */
         struct sockaddr_in client;
         socklen_t clen = sizeof(client);
-        /* parse query source */
-        /* recvfrom yerine recv kullandık, source'u bilmiyoruz.
-         * Gerçek bir client addr parse eden recvfrom'a geçelim: */
-        n = recvfrom(sock, buf, sizeof(buf), 0,
-                     (struct sockaddr *)&client, &clen);
-        if (n < 12) continue;
+
+        /* Tek recvfrom ile hem query'yi hem client addr'i al.
+         * Eski kodda iki recv arka arkaya çağrılıyordu → ikincisi ilk query'yi
+         * siliyordu, response asla telefona ulaşmıyordu (captive portal
+         * detection için DNS A record gerekli). */
+        int n = recvfrom(sock, buf, sizeof(buf), 0,
+                         (struct sockaddr *)&client, &clen);
+        if (n < 12) continue;  /* too short, skip */
+
+        /* DNS response oluştur:
+         * - Transaction ID ilk 2 byte'tan kopyalanır (doğru ID'ye response)
+         * - Flags: 0x8180 = Response + No error
+         * - Questions: aynen (header byte 4-5)
+         * - Answer RRs: 1 ekliyoruz, Authority/Additional: 0 */
+        memcpy(buf + 2, "\x81\x80", 2);
+        /* Questions byte'i (4-5) zaten query'de var; onu koruyoruz.
+         * Yalnızca Answer/Authority/Additional alanlarını (6-9) set et. */
+        buf[6] = 0; buf[7] = 0;  /* Authority RRs = 0 */
+        buf[8] = 0; buf[9] = 0;  /* Additional RRs = 0 */
+
+        /* Question Count zaten 1 idi (QCOUNT byte 4-5). Answer RRs'i 1 yapmak için
+         * byte 6-7'yi set ettik (0x00 0x01). Yine de mevcut query'de bu
+         * byte'lar ANCOUNT sayısıdır; bunları 1 yapmamız lazım. */
+        buf[6] = 0; buf[7] = 1;  /* ANCOUNT = 1 */
+
+        /* Answer RR: name pointer (0xC00C = "this name, off 12" → query'den al)
+         * + type A (1) + class IN (1) + TTL 60s + RDLEN 4 + RDATA 192.168.4.1 */
+        size_t resp_len = (size_t)n;
+        if (resp_len + 16 > sizeof(buf)) continue;  /* query çok uzun, skip */
+
+        buf[resp_len++] = 0xC0; buf[resp_len++] = 0x0C;  /* name pointer */
+        buf[resp_len++] = 0x00; buf[resp_len++] = 0x01;  /* Type A */
+        buf[resp_len++] = 0x00; buf[resp_len++] = 0x01;  /* Class IN */
+        buf[resp_len++] = 0x00; buf[resp_len++] = 0x00;  /* TTL = 60 */
+        buf[resp_len++] = 0x00; buf[resp_len++] = 0x3C;
+        buf[resp_len++] = 0x00; buf[resp_len++] = 0x04;  /* RDLENGTH = 4 */
+        buf[resp_len++] = 192; buf[resp_len++] = 168;  /* 192.168 */
+        buf[resp_len++] = 4;   buf[resp_len++] = 1;    /* .4.1 */
 
         sendto(sock, buf, resp_len, 0,
                (struct sockaddr *)&client, clen);
+
+        ESP_LOGD(TAG, "DNS reply sent: %u bytes to %s", (unsigned)resp_len,
+                 inet_ntoa(client.sin_addr));
     }
 
     close(sock);
