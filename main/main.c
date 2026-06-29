@@ -5,6 +5,7 @@
 #include "clock_weather.h"
 #include "display.h"
 #include "discovery.h"
+#include "telemetry.h"
 #include "driver/i2s_std.h"
 #include "encoder.h"
 #include "esp_log.h"
@@ -284,6 +285,14 @@ static void chat_task(void *pv) {
     ESP_LOGI(TAG, "Voice server connected!");
   } else {
     ESP_LOGE(TAG, "Voice server connection failed!");
+  }
+
+  /* === Phase 2A: periyodik telemetry POST başlat ===
+   * agent_server /api/telemetry'a her 10s heap/RSSI/SSID/MAC/IP/Matter
+   * bilgilerini gönderir. FletApp health tab'ı bu veriden canlı WiFi/Memory
+   * kartlarını doldurur. */
+  if (telemetry_start() != ESP_OK) {
+      ESP_LOGE(TAG, "Telemetry başlatılamadı");
   }
 
   while (1) {
