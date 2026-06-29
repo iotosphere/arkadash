@@ -20,3 +20,8 @@ CONFIG_LV_DEF_REFR_PERIOD=50
 # HAL 9000 animated GIF için GIF decoder açık (lv_gif widget).
 # APNG LVGL'de yok, GIF aynı işi görüyor (76 frame × 30ms = 2.3s döngü).
 CONFIG_LV_USE_GIF=y
+
+# WiFi provisioning HTTP server — POST /submit için mobile browser
+# header'ları (User-Agent + cookie) 512 byte'tan büyük. CONFIG_HTTPD_MAX_REQ_HDR_LEN
+# default 512 → 2048'e çıkar (431 Request Header Fields Too Large yok eder).
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048

@@ -28,6 +28,16 @@ import httpx
 import websockets
 from typing import AsyncGenerator
 import random
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# ─── Global State (Health monitoring için) ──────────────────────────────────
+START_TIME = time.time()
+
+# Aktif WebSocket client'ları takip et (health app için):
+#   ip -> {connected_at, last_msg_at, last_msg, ip}
+# Yeni bağlantı handle_client'da eklenir, finally'de çıkarılır.
+wss_clients: dict[str, dict] = {}
 
 MINIMAX_API_KEY  = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
@@ -35,6 +45,10 @@ GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
 TTS_BACKEND   = os.environ.get("TTS_BACKEND", "minimax")
 WHISPER_SERVER = "http://localhost:8080"
+
+# Health server portu — Arkadash panel/mobile health app'inin sorgulayacağı
+# REST endpoint'i (FletApp/P4 health monitor / etc.). 8088 default.
+HEALTH_HTTP_PORT = int(os.environ.get("HEALTH_PORT", "8088"))
 
 # ZeroClaw Gateway (opsiyonel)
 ZEROCLAW_HOST  = os.environ.get("ZEROCLAW_HOST", "localhost")
@@ -881,6 +895,14 @@ async def handle_client(websocket):
     session_id = client_ip
     print(f"[+] Client connected: {websocket.remote_address} (session={session_id})")
 
+    # Health tracking: yeni bağlantıyı wss_clients'a kaydet
+    wss_clients[client_ip] = {
+        "ip":          client_ip,
+        "connected_at": time.time(),
+        "last_msg_at": time.time(),
+        "last_msg":    "WS connected",
+    }
+
     audio_buffer      = bytearray()
     recording         = False
     expected_audio_len = 0
@@ -891,6 +913,17 @@ async def handle_client(websocket):
             msg_len  = len(message) if isinstance(message, (bytes, bytearray, str)) else 0
             msg_repr = repr(message)[:50] if isinstance(message, str) else "N/A"
             print(f"[DEBUG] type={type(message).__name__} len={msg_len} repr={msg_repr}")
+
+            # Health tracking: son mesaj zamanı + özeti
+            # Her mesajda güncelle — health app staleness gösterir.
+            if client_ip in wss_clients:
+                wss_clients[client_ip]["last_msg_at"] = time.time()
+                if isinstance(message, str):
+                    wss_clients[client_ip]["last_msg"] = msg_repr
+                elif isinstance(message, (bytes, bytearray)):
+                    wss_clients[client_ip]["last_msg"] = f"audio {msg_len}B"
+                else:
+                    wss_clients[client_ip]["last_msg"] = f"{type(message).__name__}"
 
             if isinstance(message, str):
                 msg_stripped = message.strip()
@@ -1076,6 +1109,11 @@ async def handle_client(websocket):
         print(f"[-] Connection closed ({session_id})")
     finally:
         active_pipelines.pop(session_id, None)
+        # Health tracking: client bağlantısı koptu
+        if client_ip in wss_clients:
+            uptime = int(time.time() - wss_clients[client_ip]["connected_at"])
+            del wss_clients[client_ip]
+            print(f"[-] Health: client {client_ip} düştü (uptime: {uptime}s)")
         # FIX: history'yi silme! Aynı IP tekrar bağlandığında korunacak.
         # Sadece yeni bağlantı günlüğünü yaz.
         print(f"[-] Session {session_id} disconnected "
@@ -1121,7 +1159,102 @@ def _udp_broadcaster(stop_event: threading.Event):
     print("[DISC] broadcaster durdu")
 
 
+# ─── Health HTTP server (port 8088) ───────────────────────────────────────────
+#
+# Sağlık monitoring için: FletApp veya başka bir tool JSON status alabilsin
+# diye minimal REST endpoint sağlar. ws_sessions'ı (bağlı client'lar) ve voice
+# pipeline istatistiklerini döner. asyncio event loop'u bloklamaz (thread'de).
+#
+# Endpoint'ler:
+#   GET /api/health → JSON: uptime, clients, spotify, voice
+#   GET /api/clients → JSON: list of client IPs
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def _send_json(self, payload: dict, status: int = 200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        # CORS — FletApp'in browser tabanlı runtime'ından gerekebilir
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _collect(self) -> dict:
+        now = time.time()
+        clients = []
+        for ip, info in wss_clients.items():
+            uptime_s = int(now - info["connected_at"])
+            last_msg_age = int(now - info.get("last_msg_at", info["connected_at"]))
+            clients.append({
+                "ip":            ip,
+                "uptime_s":      uptime_s,
+                "last_msg_age_s": last_msg_age,
+                "last_msg":      info.get("last_msg", ""),
+            })
+        # Spotify durumu (token refresh aktifken aktif)
+        spotify_enabled = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_ID != "your-spotify-client-id")
+        spotify_authed = bool(spotify_token_cache and spotify_token_cache.get("access_token"))
+        return {
+            "ts":           int(now),
+            "agent":        "arkadash-voice-server",
+            "version":      "v2.3-health",
+            "uptime_s":     int(now - START_TIME),
+            "ws_server":    "0.0.0.0:8765",
+            "clients":      clients,
+            "spotify":      {
+                "enabled":   spotify_enabled,
+                "authed":    spotify_authed,
+            },
+            "whisper_stt":  WHISPER_SERVER,
+            "voice":        {
+                "active_sessions": len(wss_clients),
+                "history_msgs":    sum(len(h) for h in conversation_histories.values()),
+            },
+        }
+
+    def do_GET(self):
+        if self.path == "/api/health" or self.path == "/health":
+            self._send_json(self._collect())
+        elif self.path == "/api/clients" or self.path == "/clients":
+            self._send_json({
+                "ts": int(time.time()),
+                "clients": [
+                    {"ip": ip, "uptime_s": int(time.time() - v["connected_at"])}
+                    for ip, v in wss_clients.items()
+                ],
+            })
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):  # access log bastır
+        pass
+
+
+def _start_health_server(port: int = HEALTH_HTTP_PORT):
+    """Health HTTP server'ı daemon thread'de başlat. asyncio loop'u bloklamaz."""
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        t = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name="health-http",
+        )
+        t.start()
+        print(f"[HEALTH] HTTP server :{port} başlatıldı (FletApp / health app için)")
+        print(f"[HEALTH] Endpoints: GET /api/health, /api/clients")
+        return server
+    except OSError as e:
+        print(f"[HEALTH] Port {port} kullanımda: {e} — health server başlatılamadı")
+        return None
+
+
 async def main():
+    # Health HTTP server'ı başlat (FletApp / mobile health app için).
+    # asyncio loop'tan ÖNCE yapılır — thread daemon olarak çalışır.
+    _start_health_server()
+
     # Spotify token'ı başlat
     await refresh_spotify_token()
 

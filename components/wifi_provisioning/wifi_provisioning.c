@@ -207,6 +207,12 @@ static esp_err_t start_http_server(void)
     cfg.lru_purge_enable = true;
     cfg.stack_size = 4096;
 
+    /* Mobile browser'lar uzun User-Agent + cookie header'ları yollar;
+     * default 512 byte yetmiyor (431 Request Header Fields Too Large).
+     * Limitler sdkconfig üzerinden:
+     *   CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048 (dkconfig.defaults/defaults)
+     *   CONFIG_HTTPD_MAX_URI_LEN=512 (URI'ler kısa) */
+
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         return ESP_FAIL;
