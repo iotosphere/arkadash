@@ -39,6 +39,11 @@ START_TIME = time.time()
 # Yeni bağlantı handle_client'da eklenir, finally'de çıkarılır.
 wss_clients: dict[str, dict] = {}
 
+# Phase 2A (2026-06-29): P4 firmware her 10s'de POST /api/telemetry gönderir.
+# Key = client IP (P4 WiFi STA IP, ws_connections ile aynı olur).
+# Value: {heap_free, rssi, ssid, mac, ip_local, uptime_s, matter_count, last_post_at}
+p4_telemetry: dict[str, dict] = {}
+
 MINIMAX_API_KEY  = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_GROUP_ID = os.environ.get("MINIMAX_GROUP_ID", "")
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
@@ -1194,7 +1199,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             })
         # Spotify durumu (token refresh aktifken aktif)
         spotify_enabled = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_ID != "your-spotify-client-id")
-        spotify_authed = bool(spotify_token_cache and spotify_token_cache.get("access_token"))
+        spotify_authed = bool(spotify_token)
         return {
             "ts":           int(now),
             "agent":        "arkadash-voice-server",
@@ -1202,6 +1207,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             "uptime_s":     int(now - START_TIME),
             "ws_server":    "0.0.0.0:8765",
             "clients":      clients,
+            "p4_telemetry": _telemetry_snapshot(now),
             "spotify":      {
                 "enabled":   spotify_enabled,
                 "authed":    spotify_authed,
@@ -1212,6 +1218,35 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 "history_msgs":    sum(len(h) for h in conversation_histories.values()),
             },
         }
+
+    def do_POST(self):
+        """P4 firmware buraya periyodik telemetry POST eder (her 10s).
+        Body JSON: {heap_free, rssi, ssid, mac, ip_local, uptime_s, matter_count}
+        Sender IP = key (ws_clients ile aynı IP olur genellikle)."""
+        if self.path not in ("/api/telemetry", "/telemetry"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length) if length else b"{}"
+            data   = json.loads(body) if body else {}
+        except (ValueError, json.JSONDecodeError) as e:
+            self._send_json({"ok": False, "err": f"invalid json: {e}"}, status=400)
+            return
+
+        sender_ip = self.client_address[0]
+        # P4 hem IP hem mac'i body'de gönderebilir — IP'yi öncelikli kullan.
+        if not data.get("ip_local"):
+            data["ip_local"] = sender_ip
+        data["last_post_at"] = time.time()
+        data["last_post_age_s"] = 0
+        p4_telemetry[sender_ip] = data
+
+        # Stale entry'leri de drop et (30s'den eski P4'ler)
+        _gc_stale_telemetry(now=time.time())
+
+        self._send_json({"ok": True, "stored_for": sender_ip})
 
     def do_GET(self):
         if self.path == "/api/health" or self.path == "/health":
@@ -1232,6 +1267,26 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _telemetry_snapshot(now: float) -> list:
+    """Phase 2A: P4 telemetry dict'ini list[dict] olarak döner.
+    Her entry'ye 'stale' flag ekler (last_post > 30s = stale=True)."""
+    out = []
+    for ip, info in p4_telemetry.items():
+        entry = dict(info)
+        entry["ip"]     = ip
+        entry["stale"]  = bool(now - info.get("last_post_at", 0) > 30)
+        out.append(entry)
+    return out
+
+
+def _gc_stale_telemetry(now: float, ttl_s: int = 60) -> None:
+    """60 saniye post etmeyen P4'ü düşür — sonsuz dict büyümez."""
+    stale = [ip for ip, info in p4_telemetry.items()
+             if now - info.get("last_post_at", 0) > ttl_s]
+    for ip in stale:
+        p4_telemetry.pop(ip, None)
+
+
 def _start_health_server(port: int = HEALTH_HTTP_PORT):
     """Health HTTP server'ı daemon thread'de başlat. asyncio loop'u bloklamaz."""
     try:
@@ -1243,7 +1298,7 @@ def _start_health_server(port: int = HEALTH_HTTP_PORT):
         )
         t.start()
         print(f"[HEALTH] HTTP server :{port} başlatıldı (FletApp / health app için)")
-        print(f"[HEALTH] Endpoints: GET /api/health, /api/clients")
+        print(f"[HEALTH] Endpoints: GET /api/health, /api/clients · POST /api/telemetry")
         return server
     except OSError as e:
         print(f"[HEALTH] Port {port} kullanımda: {e} — health server başlatılamadı")
