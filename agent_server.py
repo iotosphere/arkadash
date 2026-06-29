@@ -20,8 +20,10 @@ import json
 import wave
 import struct
 import array
+import socket
 import tempfile
 import subprocess
+import threading
 import httpx
 import websockets
 from typing import AsyncGenerator
@@ -1082,6 +1084,43 @@ async def handle_client(websocket):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _get_local_ip() -> str:
+    """Routing interface üzerinden kendi IP'mizi bul (192.168.1.X gibi).
+    Broadcast için doğru IP'yi bulmak kritik — socket.gethostbyname()
+    bazen 127.0.0.1 döner."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))  # routing olmayan hedef, bağlantı kurmaz
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+def _udp_broadcaster(stop_event: threading.Event):
+    """Her 5 saniyede "ARKADASH:<ip>" UDP broadcast gönder.
+    P4 firmware UDP 53000'de dinler, agent_server'ın IP'sini
+    otomatik öğrenir (mDNS/Bonjour alternatifi).
+    Background thread, daemon=True → process kapanınca ölür."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(1.0)  # recv yok ama future-proof
+
+    while not stop_event.is_set():
+        try:
+            ip = _get_local_ip()
+            msg = f"ARKADASH:{ip}:8765".encode("utf-8")
+            sock.sendto(msg, ("255.255.255.255", 53000))
+            print(f"[DISC] broadcast gönderildi: {msg.decode()} -> 255.255.255.255:53000")
+        except Exception as e:
+            print(f"[DISC] broadcast hatası: {e}")
+        # 5 saniye bekle (stop_event check ile)
+        stop_event.wait(5.0)
+
+    sock.close()
+    print("[DISC] broadcaster durdu")
+
+
 async def main():
     # Spotify token'ı başlat
     await refresh_spotify_token()
@@ -1122,9 +1161,26 @@ async def main():
     except Exception as e:
         print(f"[WS] ERROR starting server: {type(e).__name__}: {e}")
         raise
+
+    # === UDP broadcast başlat (P4 keşif için) ===
+    # Daemon thread: process kapanınca otomatik ölür. asyncio event loop'u
+    # bloklamaz çünkü ayrı thread'de koşar.
+    disc_stop = threading.Event()
+    disc_thread = threading.Thread(
+        target=_udp_broadcaster,
+        args=(disc_stop,),
+        daemon=True,
+        name="udp-broadcaster"
+    )
+    disc_thread.start()
+    print(f"[DISC] UDP broadcaster başlatıldı (5s interval, local IP: {_get_local_ip()})")
+
     async with server:
         print("[WS] Server is now accepting connections")
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        finally:
+            disc_stop.set()
 
 
 if __name__ == "__main__":

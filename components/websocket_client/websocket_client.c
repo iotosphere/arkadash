@@ -243,6 +243,21 @@ esp_err_t ws_init(const char *uri)
     return ESP_OK;
 }
 
+/* Re-init: discovery yeni IP bulduğunda çağrılır. Eski client'ı yıkıp
+ * yeniden oluşturur. Ring buffer'ı koruruz (state preservasyonu). */
+esp_err_t ws_reinit(const char *uri)
+{
+    ESP_LOGI(TAG, "Reinit: yeni URI ile yeniden bağlanılıyor: %s", uri);
+
+    if (s_ws_handle) {
+        esp_websocket_client_stop(s_ws_handle);
+        esp_websocket_client_destroy(s_ws_handle);
+        s_ws_handle = NULL;
+    }
+
+    return ws_init(uri);
+}
+
 esp_err_t ws_connect(void)
 {
     if (!s_ws_handle) {

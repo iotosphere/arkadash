@@ -4,6 +4,7 @@
 #include "bricks_breaker.h"
 #include "clock_weather.h"
 #include "display.h"
+#include "discovery.h"
 #include "driver/i2s_std.h"
 #include "encoder.h"
 #include "esp_log.h"
@@ -103,7 +104,13 @@ static const char *TAG = "app_main";
 #define LONG_PRESS_MS 800u
 #define SLEEP_TIMEOUT_MS 90000u /* 1.5 dk */
 #define REC_BUF_SIZE (16000 * 2 * 5)
-#define VOICE_SERVER_URI "ws://192.168.1.6:8765"
+
+/* voice_server URI runtime'da discovery_get_server_ip() ile oluşturulur (2026-06-29).
+ * agent_server.py her 5 saniyede "ARKADASH:<ip>" broadcast yapar (UDP 53000),
+ * P4 dinler, ilk broadcast'te IP öğrenilir, URI dinamik kurulur.
+ * Mac reboot → yeni IP → yeni broadcast → ws_reinit tetiklenir.
+ * Avantaj: mDNS / Bonjour gerekmez (kullanıcının macOS'unda broken). */
+#define VOICE_SERVER_PORT 8765
 
 static bool is_recording = false;
 static bool is_ai_speaking = false;
@@ -217,8 +224,21 @@ static void chat_task(void *pv) {
 
   ESP_LOGI(TAG, "Chat task started RX=%p TX=%p", rx, tx);
 
-  ESP_LOGI(TAG, "Connecting to voice server...");
-  ws_init(VOICE_SERVER_URI);
+  /* === UDP broadcast discovery başlat ===
+   * agent_server.py her 5s IP yayar → biz 5s bekleyip ilk broadcast'i al,
+   * yoksa fallback kullan (192.168.1.50).
+   * Sonra ws_init ile dinamik URI oluştur. */
+  ESP_LOGI(TAG, "Server IP discovery başlatılıyor...");
+  if (discovery_start() != ESP_OK) {
+      ESP_LOGE(TAG, "Discovery başlatılamadı, fallback IP kullanılacak");
+  }
+  discovery_wait_for_first(5000);
+
+  char ws_uri[64];
+  snprintf(ws_uri, sizeof(ws_uri), "ws://%s:%d",
+           discovery_get_server_ip(), VOICE_SERVER_PORT);
+  ESP_LOGI(TAG, "Connecting to %s", ws_uri);
+  ws_init(ws_uri);
   if (ws_connect() == ESP_OK) {
     ESP_LOGI(TAG, "Voice server connected!");
   } else {

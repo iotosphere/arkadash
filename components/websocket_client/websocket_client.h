@@ -5,6 +5,10 @@
 #include "esp_err.h"
 
 esp_err_t ws_init(const char *uri);
+
+/* Re-init: discovery yeni IP bulduğunda ws_destroy + ws_init wrapper.
+ * Ring buffer korunur (state preservasyonu). */
+esp_err_t ws_reinit(const char *uri);
 esp_err_t ws_connect(void);
 esp_err_t ws_disconnect(void);
 esp_err_t ws_deinit(void);
