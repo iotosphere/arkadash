@@ -59,7 +59,7 @@ static esp_err_t es8311_init_codec(void)
     ESP_ERROR_CHECK(es8311_sample_frequency_config(es_handle, EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE, EXAMPLE_SAMPLE_RATE));
     ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, 65, NULL));  // Medium volume
     ESP_ERROR_CHECK(es8311_microphone_config(es_handle, false));
-    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, 6));  // Higher mic gain
+    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, 4));  // +24 dB — was +36 dB (clipping), tried +18 dB (too quiet)
 
     ESP_LOGI(TAG, "ES8311 initialized");
     return ESP_OK;
@@ -69,8 +69,8 @@ static esp_err_t i2s_init(void)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
     // DMA buffer ayarları - ESP32P4 için uygun değerler
-    chan_cfg.dma_desc_num = 6;     // 6 buffer (iyi performans)
-    chan_cfg.dma_frame_num = 240;  // 240 frame/buffer (16kHz stereo için ideal)
+    chan_cfg.dma_desc_num = 12;    // 12 buffer (2x headroom — DMA underflow önler)
+    chan_cfg.dma_frame_num = 240;  // 240 frame/buffer (16kHz mono için ideal)
     chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
 

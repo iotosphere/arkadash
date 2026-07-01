@@ -14,6 +14,8 @@ Spotify Remote: SPOTIFY_* komutları ile playlist browse ve playback control
 import sys
 sys.path.insert(0, '/Users/serhatsaday/arkadash/orch/lib/python3.14/site-packages')
 
+from thefuzz import process, fuzz
+
 import asyncio
 import os
 import json
@@ -72,6 +74,92 @@ active_pipelines:       dict[str, bool]  = {}
 
 # History kaç mesaj sonra eskiler temizlensin (token tasarrufu)
 MAX_HISTORY_TURNS = 20  # kullanıcı + asistan mesaj sayısı
+
+# ─── Fuzzy Komut Normalleştirme (thefuzz) ────────────────────────────────────
+# STT çıktısı bazen halüsinasyon yapıyor ("uşukları aç" -> "ışıkları aç").
+# Vocabulary bias yetersiz kaldığında, bu tablo ile en yakın kanonik komutu bul.
+# Vocabulary prompt ile tutarlı tut (~/arkadash/AGENTS.md "Whisper STT" bölümü).
+
+# Türkçe STT'nin en sık karıştırdığı sesli harfleri önceden dönüştür.
+# thefuzz karakter edit distance kullanır; "u" ile "ı" farkı mesafeyi büyütür.
+# Önce bu dönüşüm, sonra fuzzy — "uşukları" -> "ışıklıri" -> "ışıkları".
+TURKISH_PHONETIC_MAP = str.maketrans({
+    "u": "ı",  # en yaygın halüsinasyon: "uşıkları" -> "ışıkları"
+    "ü": "i",
+    "ö": "o",
+})
+
+
+def _phonetic_normalize(text: str) -> str:
+    return text.translate(TURKISH_PHONETIC_MAP)
+
+CANONICAL_COMMANDS = [
+    "ışıkları aç",
+    "ışıkları kapat",
+    "salon ışıkları aç",
+    "salon ışıkları kapat",
+    "salon ışıklarını aç",
+    "salon ışıklarını kapat",
+    "yatak odası ışıkları aç",
+    "yatak odası ışıkları kapat",
+    "mutfak ışıkları aç",
+    "mutfak ışıkları kapat",
+    "banyo ışıkları aç",
+    "çocuk odası ışıkları aç",
+    "sıcaklık kaç",
+    "sıcaklık nedir",
+    "nem kaç",
+    "müzik aç",
+    "müzik durdur",
+    "müzik kapat",
+    "sonraki şarkı",
+    "önceki şarkı",
+    "ses aç",
+    "ses kapat",
+    "perdeleri aç",
+    "perdeleri kapat",
+]
+FUZZY_THRESHOLD = 85  # Yüzde eşleşme — yüksek tut, sohbet/selam yanlış eşleşmesin
+
+
+def normalize_command(text: str) -> str:
+    """STT çıktısını kanonik komuta fuzzy-match ile eşleştir.
+
+    Yüksek eşleşme varsa kanonik komutu, yoksa olduğu gibi döner.
+    Sohbet/selam ("nasılsın", "teşekkürler") eşleşmemeli — bunlar LLM'e gider.
+    Threshold 85 = ortalama %85 token benzerliği gerekli.
+
+    Akış:
+    1. Fonetik ön-normalleştirme (u→ı, ü→i, ö→o) — STT halüsinasyonları için
+    2. Thefuzz WRatio + partial_ratio — sıra/uzunluk esnek
+    3. Kelime sayısı kontrolü (<1 veya >6 kelime = sohbet, fuzzy atlanır)
+    """
+    if not text or not text.strip():
+        return text
+    candidate = text.strip().lower()
+    word_count = len(candidate.split())
+    if word_count < 1 or word_count > 6:
+        return text
+    # Fonetik ön-dönüşüm
+    phon = _phonetic_normalize(candidate)
+    try:
+        # WRatio + partial_ratio: birden fazla scorer'ın en iyisini al.
+        match, score = process.extractOne(
+            phon, CANONICAL_COMMANDS, scorer=fuzz.WRatio
+        )
+        # partial_ratio de ekle: substring uyumu yakalar.
+        match2, score2 = process.extractOne(
+            phon, CANONICAL_COMMANDS, scorer=fuzz.partial_ratio
+        )
+        # İki scorer'ın en yüksek puanlı eşleşmesini al.
+        if score2 > score:
+            match, score = match2, score2
+        if score >= FUZZY_THRESHOLD:
+            print(f"[FUZZ] '{text}' -> '{match}' (score={score})")
+            return match
+    except Exception as e:
+        print(f"[FUZZ] Error: {e}")
+    return text
 
 # ─── LED Control (ESP32-S3 HTTP API → Matter → ESP32-H2) ──────────────────────
 
@@ -365,6 +453,34 @@ async def transcribe_audio(pcm_bytes: bytes) -> str:
             print(f"[STT] Audio too short: {len(mono_samples)/16000:.2f}s")
             return ""
 
+        # Energy threshold: çok sessiz kayıtları (klima, uğultu, fısıltı)
+        # Whisper'a hiç gönderme — hallüsinasyon + gereksiz CPU yükü önler.
+        ENERGY_THRESHOLD = 800  # int16 max 32767
+        if max_amp < ENERGY_THRESHOLD:
+            print(f"[STT] Silent audio, skipping "
+                  f"(max_amp={max_amp} < {ENERGY_THRESHOLD})")
+            return ""
+
+        # Clipping normalleştirmesi (firmware kalıcı çözüm; bu geçici)
+        # P4 mikrofon gain'i fazla, ses max=32768'e ulaşıp clipping yapıyor.
+        # Peak'leri 16384'e çekerek harmonik distortion'ı göreceli azaltır.
+        NORMALIZE_TARGET = 16384
+        if max_amp > NORMALIZE_TARGET:
+            scale = NORMALIZE_TARGET / max_amp
+            mono_samples = array.array('h', [
+                max(-32768, min(32767, int(s * scale))) for s in mono_samples
+            ])
+            new_max = max(abs(s) for s in mono_samples)
+            print(f"[STT] Normalized peak: {max_amp} -> {new_max} "
+                  f"(scale={scale:.3f}, firmware gain fix needed)")
+
+        # Trailing silence: PTT_STOP anında son hece yarıda kesilmesin
+        # 600ms × 16000Hz = 9600 sıfır sample
+        TRAILING_SILENCE_MS = 600
+        trailing_samples = int(16000 * TRAILING_SILENCE_MS / 1000)
+        mono_samples.extend([0] * trailing_samples)
+        print(f"[STT] Padded +{TRAILING_SILENCE_MS}ms trailing silence")
+
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
             temp_path = f.name
 
@@ -378,11 +494,35 @@ async def transcribe_audio(pcm_bytes: bytes) -> str:
             print("[STT] Transcribing with whisper.cpp server...")
             with open(temp_path, 'rb') as f:
                 files = {'file': ('audio.wav', f, 'audio/wav')}
+                # Türkçe komut vocabulary bias — Whisper'in halüsinasyonunu
+                # büyük oranda azaltır. Sık kullandığın komutları buraya ekle.
+                initial_prompt = (
+                    "Işıkları aç, Işıkları kapat, Işıkları. "
+                    "Merhaba Arkadash. Selamlar, merhaba, günaydın, iyi geceler, "
+                    "teşekkürler, hoşça kal, nasılsın. "
+                    "Işıkları aç, kapat, rengini değiştir, sıcaklık kaç, nem kaç, "
+                    "salon, yatak odası, mutfak, banyo, çocuk odası. "
+                    "Müzik aç, durdur, sonraki şarkı, önceki şarkı, ses aç, ses kapat. "
+                    "Perdeleri aç, perdeleri kapat. "
+                    "Kısa Türkçe sesli komutlar."
+                )
+                params = {
+                    "response_format":           "json",
+                    "language":                  "tr",
+                    "prompt":                    initial_prompt,
+                    "temperature":               "0.0",   # greedy — halüsinasyon azaltır
+                    "temperature_inc":           "0.0",   # fallback yapmasın
+                    "beam_size":                 "1",     # beam 5'ten 3-4 kat hızlı
+                    "best_of":                   "1",
+                    "no_speech_threshold":       "0.7",   # kısa/belirsiz sesi daha agresif reddet
+                    "compression_ratio_threshold":"2.4",  # tekrarlayan metin filtresi
+                    "logprob_threshold":         "-1.0",  # düşük güvenli tahmin reddi
+                }
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(
                         f"{WHISPER_SERVER}/inference",
                         files=files,
-                        params={"output_format": "json"}
+                        params=params,
                     )
             if response.status_code == 200:
                 result = response.json()
@@ -584,7 +724,14 @@ def clean_text_for_tts(text: str) -> str:
 # ─── TTS ──────────────────────────────────────────────────────────────────────
 
 async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
-    """MiniMax speech-hd TTS (synchronous - tüm audio bir seferde gelir)."""
+    """MiniMax speech-hd TTS (synchronous - tüm audio bir seferde gelir).
+
+    GitHub canonical: iotosphere/arkadash — mp3 + ffmpeg decode + pacing.
+    Neden sync PCM streaming DEĞİL: MiniMax T2A stream cumulative hex yolluyor
+    (her chunk önceki tüm sesin üstüne eklenmiş hali) — P4'e aynı sesin üst üste
+    binen kopyalarını oynatıyor ("cümle iki kere" + "cazırtı"). Sync çağrı + mp3
+    decode bu sorunu kökünden çözer; P4'e sadece tek, temiz PCM akışı gider.
+    """
     try:
         import numpy as np
         from scipy.signal import resample_poly
@@ -597,18 +744,19 @@ async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
         payload = {
             "model": "speech-2.8-hd",
             "text": text,
-            "stream": False,
+            "stream": False,                  # ← SYNC: cumulative stream bug'ından kurtul
             "voice_setting": {
-                "voice_id": "Turkish_CalmWoman"
+                "voice_id": "Turkish_CalmWoman",
             },
             "audio_setting": {
                 "sample_rate": 24000,
                 "bitrate": 128000,
-                "format": "mp3"
-            }
+                "format": "mp3",              # ← MP3: ffmpeg decode → 16kHz PCM
+            },
+            "language_boost": "Turkish",
         }
 
-        print(f"[TTS-MiniMax] Requesting (sync): '{text[:50]}...'")
+        print(f"[TTS-MiniMax] Requesting (sync mp3): '{text[:50]}...'")
 
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(url, headers=headers, json=payload)
@@ -620,7 +768,7 @@ async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
         try:
             json_data = response.json()
         except Exception:
-            print(f"[TTS-MiniMax] Failed to parse JSON response: {response.text[:200]}")
+            print(f"[TTS-MiniMax] Failed to parse JSON: {response.text[:200]}")
             return
 
         audio_hex = json_data.get("data", {}).get("audio", "")
@@ -629,42 +777,49 @@ async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
             return
 
         mp3_data = bytes.fromhex(audio_hex)
-        print(f"[TTS-MiniMax] MP3 decoded from hex: {len(mp3_data)} bytes")
+        print(f"[TTS-MiniMax] MP3: {len(mp3_data)} bytes")
 
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f_in:
             f_in.write(mp3_data)
             mp3_path = f_in.name
         pcm_path = mp3_path + '.pcm'
 
-        print(f"[TTS-MiniMax] MP3 file written to {mp3_path}")
-
         try:
+            # ffmpeg decode: mp3 → 24kHz s16le mono
             result = subprocess.run([
-                'ffmpeg', '-y', '-v', 'debug', '-f', 'mp3', '-i', mp3_path,
+                'ffmpeg', '-y', '-v', 'error', '-f', 'mp3', '-i', mp3_path,
                 '-f', 's16le', '-acodec', 'pcm_s16le',
                 '-ar', '24000', '-ac', '1', pcm_path
             ], capture_output=True, timeout=60)
 
-            stderr = result.stderr.decode('utf-8', errors='replace')
-            stdout = result.stdout.decode('utf-8', errors='replace')
-            
-            print(f"[TTS-MiniMax] ffmpeg rc={result.returncode}")
             if result.returncode != 0:
-                print(f"[TTS-MiniMax] ffmpeg STDOUT (first 300): {stdout[:300]}")
-                print(f"[TTS-MiniMax] ffmpeg STDERR (first 500): {stderr[:500]}")
+                err = result.stderr.decode('utf-8', errors='replace')[:500]
+                print(f"[TTS-MiniMax] ffmpeg error: {err}")
                 return
 
             with open(pcm_path, 'rb') as f:
                 pcm_data = f.read()
 
+# 24k → 16k downsample (resample_poly up=2, down=3)
             samples_24k = np.frombuffer(pcm_data, dtype=np.int16)
             samples_16k = resample_poly(samples_24k, 2, 3).astype(np.int16)
+
+            # Soft limiter: ES8311 DAC full-scale'de clipping yapıyor (ses "çatlamalı" duyuluyor).
+            # tanh soft saturation: sample'lar yumuşak doyuma uğrar, distortion minimal,
+            # full-scale'in üstüne çıkan peak'ler -12000/+12000 bandına sıkıştırılır.
+            samples_f = samples_16k.astype(np.float32) / 32768.0
+            samples_f = np.tanh(samples_f * 1.3) * 0.65
+            samples_16k = (samples_f * 32768).astype(np.int16)
             pcm_mono = samples_16k.tobytes()
 
+            # P4 firmware audio.c: EXAMPLE_SAMPLE_RATE=16000, I2S_SLOT_MODE_MONO.
+            # Yani P4 I2S 16 kHz mono PCM bekliyor — 32k yollarsak ses 2x yavaş + kalın olur.
             duration = len(pcm_mono) / (16000 * 2)
             print(f"[TTS-MiniMax] PCM: {len(pcm_mono)} bytes, {duration:.2f}s @ 16kHz mono")
 
-            chunk_size = 1024
+            # Küçük chunk'lar — P4 ring buffer/queue hızlı alır, pacing
+            # process_audio tarafında asyncio.sleep(0.025) ile kontrol edilir.
+            chunk_size = 4096
             for i in range(0, len(pcm_mono), chunk_size):
                 yield pcm_mono[i:i+chunk_size]
 
@@ -677,7 +832,8 @@ async def tts_minimax_stream(text: str) -> AsyncGenerator[bytes, None]:
 
     except Exception as e:
         print(f"[TTS-MiniMax] Error: {type(e).__name__}: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
 
 
 async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
@@ -722,8 +878,9 @@ async def tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
             duration = len(pcm_data) / (16000 * 2 * 2)
             print(f"[TTS-Edge] PCM: {len(pcm_data)} bytes, {duration:.2f}s @ 16kHz stereo")
 
-            # Küçük chunk'lar - ESP daha hızlı alır, TCP tamponı dolmaz
-            chunk_size = 1024
+            # 16384 denendi — P4 timeout. Orta boyutta kal, çıtırtı çözümü
+            # yarın P4 firmware DMA buffer büyütme ile yapılacak
+            chunk_size = 4096
             for i in range(0, len(pcm_data), chunk_size):
                 yield pcm_data[i:i+chunk_size]
 
@@ -766,7 +923,7 @@ async def tts_gemini_stream(text: str) -> AsyncGenerator[bytes, None]:
         stereo[0::2] = samples_16k
         stereo[1::2] = samples_16k
         pcm_output = stereo.tobytes()
-        for i in range(0, len(pcm_output), 4096):
+        for i in range(0, len(pcm_output), 4096):  # 16384 P4 timeout
             yield pcm_output[i:i+4096]
     except Exception as e:
         print(f"[TTS-Gemini] Error: {type(e).__name__}: {e}")
@@ -797,7 +954,7 @@ async def tts_google_cloud_stream(text: str) -> AsyncGenerator[bytes, None]:
         stereo[0::2] = samples_16k
         stereo[1::2] = samples_16k
         pcm_output = stereo.tobytes()
-        for i in range(0, len(pcm_output), 4096):
+        for i in range(0, len(pcm_output), 4096):  # 16384 P4 timeout
             yield pcm_output[i:i+4096]
     except Exception as e:
         print(f"[TTS-GCloud] Error: {type(e).__name__}: {e}")
@@ -845,33 +1002,60 @@ async def process_audio(websocket, session_id: str, audio_buffer: bytearray, use
             return
 
         await websocket.send(json.dumps({"type": "transcript", "text": user_text}))
+
+        # Fuzzy match: STT halüsinasyonlarını kanonik komuta eşle.
+        # "uşukları aç" -> "ışıkları aç" gibi düzeltmeler için LLM'e
+        # normalize edilmiş versiyonu gönderiyoruz. Sohbet/selam
+        # fuzzy'ye takılmaz (kelime sayısı veya threshold yüzünden).
+        normalized = normalize_command(user_text)
+        if normalized != user_text:
+            print(f"[FUZZ] Sending normalized to LLM: '{normalized}'")
+            user_text = normalized
+
         await websocket.send(json.dumps({"type": "status", "msg": "Thinking..."}))
 
+        # Cümle-bazlı TTS tetikleme (kaynak: ~/aiAsistant/Aiworked/server.py).
+        # Her cümle sonunda (". ! ? ... \n") hemen TTS başlat — büyük burst yerine
+        # küçük parçalar. Pacing: tts_minimax_stream 1024 byte chunk veriyor
+        # (16kHz mono = 32 ms ses). 0.034s pacing = 30 KB/s; P4 DMA 32 KB/s tüketir.
+        # 1-2 ms/saniye aralık ile P4 queue'su dolu kalır, "buffer underflow" olmaz.
         sentence_buf = ""
+        total_pcm_bytes = 0
+
         async for token in chat_stream(session_id, user_text, use_zeroclaw):
             sentence_buf += token
+            if sentence_buf.rstrip().endswith((".", "!", "?", "...", "\n")):
+                text = clean_text_for_tts(sentence_buf.strip())
+                if len(text) > 2:
+                    print(f"[TTS→] {text[:60]}...")
+                    await websocket.send(json.dumps({"type": "tts_start"}))
+                    async for pcm in tts_stream(text):
+                        await websocket.send(pcm)
+                        total_pcm_bytes += len(pcm)
+# Pacing: 1024 byte / 25 ms = 41 KB/s (16 kHz mono DMA 32 KB/s'den %28 hızlı).
+                        # Buffer yavaşça dolu kalır, queue 64 KB / 9 KB/s = 7 saniyede dolar,
+                        # cümle (2-3s) bitmeden dolmaz, underflow olmaz.
+                        await asyncio.sleep(0.060)
+                    await websocket.send(json.dumps({"type": "tts_end"}))
+                sentence_buf = ""
 
-        sentence_buf = sentence_buf.strip()
-        if not sentence_buf:
+        # Cümle sonu gelmemiş kalan kısım (LLM "..." ile bitirmemiş olabilir)
+        if sentence_buf.strip():
+            text = clean_text_for_tts(sentence_buf.strip())
+            if len(text) > 2:
+                print(f"[TTS→] {text[:60]}...")
+                await websocket.send(json.dumps({"type": "tts_start"}))
+                async for pcm in tts_stream(text):
+                    await websocket.send(pcm)
+                    total_pcm_bytes += len(pcm)
+                    await asyncio.sleep(0.014)
+                await websocket.send(json.dumps({"type": "tts_end"}))
+
+        if total_pcm_bytes == 0:
             await websocket.send(json.dumps({"type": "error", "msg": "LLM empty response"}))
             return
 
-        # TTS'den önce emojileri temizle - ses patlamasını önler
-        tts_text = clean_text_for_tts(sentence_buf)
-        print(f"[TTS] Synthesizing: {tts_text[:60]}...")
-        await websocket.send(json.dumps({"type": "tts_start"}))
-        await asyncio.sleep(0.05)
-
-        total_pcm_bytes = 0
-        async for pcm in tts_stream(tts_text):
-            await websocket.send(pcm)
-            total_pcm_bytes += len(pcm)
-            await asyncio.sleep(0.03)
-
-        await asyncio.sleep(0.2)
-        print(f"[TTS] All PCM sent ({total_pcm_bytes} bytes), sending tts_end")
-        await websocket.send(json.dumps({"type": "tts_end", "size": total_pcm_bytes}))
-
+        print(f"[TTS] Total PCM sent: {total_pcm_bytes} bytes")
         playback_duration = total_pcm_bytes / (16000 * 2)
         print(f"[+] Playback: {playback_duration:.2f}s")
         await asyncio.sleep(playback_duration + 0.5)

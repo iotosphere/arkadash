@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
@@ -21,10 +22,17 @@ static bool   s_has_error            = false;  /* server error aldık, ring buff
 static size_t s_expected_size        = 0;
 static bool   s_agent_mode           = false;  /* Chat=false (MiniMax), Agent=true (ZeroClaw) */
 
-/* 64 KB statik ring buffer - TTS PCM verisi için */
-static uint8_t           s_rb_storage[65536];
-static StaticRingbuffer_t s_rb_struct;
-static RingbufHandle_t    s_rb_handle = NULL;
+/* Queue-based PCM akışı (referans: embeddedv5 components/app_websocket.c).
+ * Her binary WebSocket frame malloc ile allocate edilir, queue'ya gönderilir.
+ * ws_stream_read queue'dan blocking okur, kopyalayıp free eder.
+ * Ring buffer overflow yok — malloc başarısız olursa drop, ama PSRAM'den geliyor.
+ */
+typedef struct {
+    uint8_t *data;
+    size_t   len;
+} audio_chunk_t;
+
+static QueueHandle_t s_chunk_queue = NULL;
 
 /* ------------------------------------------------------------------ */
 
@@ -41,12 +49,10 @@ bool     ws_is_connected(void)         { return s_connected; }
 
 static void drain_ring_buffer(void)
 {
-    if (!s_rb_handle) return;
-    size_t   len  = 0;
-    uint8_t *item = NULL;
-    while ((item = (uint8_t *)xRingbufferReceiveUpTo(
-                s_rb_handle, &len, 0, 1)) != NULL) {
-        vRingbufferReturnItem(s_rb_handle, (void *)item);
+    if (!s_chunk_queue) return;
+    audio_chunk_t chunk;
+    while (xQueueReceive(s_chunk_queue, &chunk, 0) == pdTRUE) {
+        if (chunk.data) free(chunk.data);
     }
 }
 
@@ -62,21 +68,20 @@ void ws_stream_clear(void) { drain_ring_buffer(); }
 
 size_t ws_stream_read(uint8_t *buf, size_t len, uint32_t timeout_ms)
 {
-    if (!s_rb_handle || !buf || len == 0) return 0;
+    if (!s_chunk_queue || !buf || len == 0) return 0;
 
-    /* Error state'da ring buffer invalid — boşalt ve dön */
+    /* Error state'da queue invalid — boşalt ve dön */
     if (s_has_error) {
         drain_ring_buffer();
         return 0;
     }
 
-    size_t   item_size = 0;
-    uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(
-        s_rb_handle, &item_size, pdMS_TO_TICKS(timeout_ms), len);
-    if (item) {
-        size_t to_copy = (item_size < len) ? item_size : len;
-        memcpy(buf, item, to_copy);
-        vRingbufferReturnItem(s_rb_handle, (void *)item);
+    audio_chunk_t chunk;
+    if (xQueueReceive(s_chunk_queue, &chunk, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        if (!chunk.data || chunk.len == 0) return 0;
+        size_t to_copy = (chunk.len < len) ? chunk.len : len;
+        memcpy(buf, chunk.data, to_copy);
+        free(chunk.data);
         return to_copy;
     }
     return 0;
@@ -176,13 +181,29 @@ else if (strstr(json_buf, "spotify_playlists")) {
             free(json_buf);
 
         } else {
-            /* Binary audio → ring buffer */
-            if (s_rb_handle) {
-                BaseType_t sent = xRingbufferSend(
-                    s_rb_handle, event->data_ptr, event->data_len, 0);
-                if (sent != pdTRUE) {
-                    ESP_LOGW(TAG, "Ring buffer full, dropped %d bytes",
+            /* Binary audio → queue (malloc + xQueueSend).
+             * Ring buffer overflow YOK — malloc ile dinamik buffer. */
+            if (s_chunk_queue) {
+                audio_chunk_t *chunk = malloc(sizeof(audio_chunk_t));
+                if (!chunk) {
+                    ESP_LOGW(TAG, "Chunk malloc failed, dropped %d bytes",
                              (int)event->data_len);
+                } else {
+                    chunk->data = malloc(event->data_len);
+                    if (!chunk->data) {
+                        ESP_LOGW(TAG, "Data malloc failed, dropped %d bytes",
+                                 (int)event->data_len);
+                        free(chunk);
+                    } else {
+                        memcpy(chunk->data, event->data_ptr, event->data_len);
+                        chunk->len = event->data_len;
+                        if (xQueueSend(s_chunk_queue, chunk, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                            ESP_LOGW(TAG, "Chunk queue full, dropped %d bytes",
+                                     (int)event->data_len);
+                            free(chunk->data);
+                            free(chunk);
+                        }
+                    }
                 }
             }
         }
@@ -208,12 +229,13 @@ esp_err_t ws_init(const char *uri)
 
     ESP_LOGI(TAG, "Connecting to %s", uri);
 
-    if (!s_rb_handle) {
-        s_rb_handle = xRingbufferCreateStatic(
-            sizeof(s_rb_storage), RINGBUF_TYPE_BYTEBUF,
-            s_rb_storage, &s_rb_struct);
-        if (!s_rb_handle) {
-            ESP_LOGE(TAG, "Failed to create ring buffer");
+    if (!s_chunk_queue) {
+        /* Queue-based chunk akışı — 64 giriş yeterli (TTS genelde < 32 chunk yapar).
+         * Her chunk ayrı allocate, queue'lar FreeRTOS memory heap'ten gelir
+         * (heap_caps malloc default PSRAM kullanır 32MB'den). */
+        s_chunk_queue = xQueueCreate(128, sizeof(audio_chunk_t));
+        if (!s_chunk_queue) {
+            ESP_LOGE(TAG, "Failed to create chunk queue");
             return ESP_FAIL;
         }
     }
