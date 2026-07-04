@@ -1602,6 +1602,11 @@ void create_screen_settings() {
      * eez-flow state. We do not need it: main.c triggers the
      * provision screen via lv_scr_load(objects.provision) from the
      * Provision button's LV_EVENT_CLICKED handler. */
+
+    /* Slider drag callbacks — defined in eez_wrapper.cpp, declared
+     * extern here so screens.c can pass them to lv_obj_add_event_cb. */
+    extern void ui_slider_volume_cb(lv_event_t *e);
+    extern void ui_slider_brightness_cb(lv_event_t *e);
     lv_obj_t *settings_parent = obj;  /* the screen object itself */
     {
         // brightness slider
@@ -1613,6 +1618,8 @@ void create_screen_settings() {
         lv_obj_set_style_bg_image_recolor(obj, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_PRESSED);
         lv_obj_set_style_border_opa(obj, 0, LV_PART_MAIN | LV_STATE_PRESSED);
         lv_obj_set_style_border_color(obj, lv_color_hex(0xffffff), LV_PART_MAIN | LV_STATE_PRESSED);
+        // User drag → display_backlight_set (PWM LEDC duty)
+        lv_obj_add_event_cb(obj, ui_slider_brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
     }
     {
         // volume slider
@@ -1621,6 +1628,8 @@ void create_screen_settings() {
         lv_obj_set_pos(obj, 0, 123);
         lv_obj_set_size(obj, 150, 10);
         lv_slider_set_value(obj, 25, LV_ANIM_OFF);
+        // User drag → audio_set_volume (es8311 DAC register 0x07)
+        lv_obj_add_event_cb(obj, ui_slider_volume_cb, LV_EVENT_VALUE_CHANGED, NULL);
     }
     {
         // Provision button

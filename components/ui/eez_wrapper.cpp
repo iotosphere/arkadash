@@ -266,4 +266,28 @@ void ui_set_brightness(int pct)
     lvgl_port_unlock();
 }
 
+/* LVGL slider drag callbacks — wired in screens.c create_screen_settings.
+ * Kullanıcı slider'ı sürüklediğinde bu callback'ler tetiklenir; ilgili
+ * audio/display API'sini çağırır. agent tarafı (services/agent.py) ileride
+ * set_volume/set_brightness tool'ları ekleyebilir — aynı audio_set_volume
+ * ve display_backlight_set fonksiyonlarını çağırarak P4 davranışını
+ * sesli komutla da kontrol edebilir. */
+void ui_slider_volume_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int pct = (int)lv_slider_get_value(slider);
+    extern void audio_set_volume(int pct);
+    audio_set_volume(pct);
+    ESP_LOGI(TAG, "ui_slider_volume_cb: %d%%", pct);
+}
+
+void ui_slider_brightness_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int pct = (int)lv_slider_get_value(slider);
+    extern void display_backlight_set(uint8_t pct);
+    display_backlight_set((uint8_t)pct);
+    ESP_LOGI(TAG, "ui_slider_brightness_cb: %d%%", pct);
+}
+
 }

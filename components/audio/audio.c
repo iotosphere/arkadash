@@ -57,7 +57,11 @@ static esp_err_t es8311_init_codec(void)
 
     ESP_ERROR_CHECK(es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
     ESP_ERROR_CHECK(es8311_sample_frequency_config(es_handle, EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE, EXAMPLE_SAMPLE_RATE));
-    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, 65, NULL));  // Medium volume
+    // Volume: 65 → 80 (medium-high). ES8311 register 0x07 = DAC digital volume,
+    // 0-100 yüzde. 100 = 0dB full scale — speaker max güçte cızırtı yapar.
+    // 80 = -2dB, dengeli; agent tarafında soft_limit gain 0.65 ile beraber
+    // pre-DAC clipping yok.
+    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, 80, NULL));
     ESP_ERROR_CHECK(es8311_microphone_config(es_handle, false));
     ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, 4));  // +24 dB — was +36 dB (clipping), tried +18 dB (too quiet)
 

@@ -1,22 +1,35 @@
 # Arkadash P4 Panel — Project Memory
 
-## Status (2026-06-11)
+## Status (2026-07-04)
 
-End-to-end pipeline **works** in `~/arkadash/` (not `~/esp/arkadashsmart/` which is the older backup):
+End-to-end pipeline **stabil** in `~/arkadash/` (`agent_server.py` SİLİNDİ → `orchestrator/`
+modüler refactor):
 
 ```
-P4 button → ws_client: LED_TOGGLE → agent_server.py → TBR HTTP /led/toggle
-  → Matter invoke → H2 LED physical toggle ✅
+P4 button → ws_client (PTT) → orchestrator (orchestrator/main.py)
+  → STT (whisper.cpp) → agent (LangGraph + tool calling) → TTS (MiniMax Turkish)
+  → WebSocket PCM → P4 ring buffer → DMA → ES8311 → speaker ✅
 ```
 
-Verified by user: "h2 rgb led toggle olarak yanıp sönüyor" on 2026-06-11 ~02:11.
+**Voice pipeline tuned** (nihai karar 2026-07-04):
+- Tek TTS çağrısı (cümle bazlı değil — cümle arası 2.5s latency cümle drop yaratıyordu)
+- pacing = 0.060s sabit (chunk 4096, 68 KB/s, DMA 32 KB/s'nin %112 üstünde)
+- tts_start sonrası 50ms bekleme (P4 firmware settle)
+- Verified: 22.58s tool call cevabı (weather.get_current) 722462 byte TAM oynandı,
+  drop yok. Hafif jitter WS frame overhead'inden.
+
+**P4 firmware stable** (ArkadashSon f27ae9b merged):
+- queue 128 (chunk_queue), DMA 12 desc x 240 frame
+- WS buffer 8192, ES8311 voice_volume 65 (init), slider override → 0-100
+- Slider callbacks: audio.c `audio_set_volume()`, ui/eez_wrapper.cpp
+  `ui_slider_volume_cb` + `ui_slider_brightness_cb`
 
 ## Hardware
 
-- **P4**: Waveshare ESP32-P4-WIFI6, chip rev v1.0, 8 MB flash, 32 MB PSRAM, IP `192.168.1.18`
-- **TBR (S3)**: `~/esp/controller/`, port `/dev/cu.usbmodem14301`, IP **`192.168.1.19`** (NOT 1.45, NOT 1.34)
+- **P4**: Waveshare ESP32-P4-WIFI6, chip rev v1.0, 8 MB flash, 32 MB PSRAM, IP `192.168.1.16`
+- **TBR (S3)**: `~/esp/controller/`, port `/dev/cu.usbmodem14301`, IP **`192.168.1.15`** (NOT 1.19)
 - **H2 light**: `~/esp/smarthome/`, port `/dev/cu.usbmodem14101`, node_id=0x1, endpoint=1, fabric 3F594493A97781BC
-- **Mac agent**: `ws://0.0.0.0:8765`, TBR HTTP `http://192.168.1.19:8766`
+- **Mac agent**: `ws://0.0.0.0:8765`, TBR HTTP `http://192.168.1.15:8766`
 - **WiFi**: `SUPERONLINE_WiFi_5292`
 
 ### Battery divider (PCB rev needed)
@@ -39,14 +52,97 @@ Schematic wires battery divider tap to **GPIO 48** — but GPIO 48 has NO ADC on
 | Component       | Path                              | Purpose                                    |
 |-----------------|-----------------------------------|--------------------------------------------|
 | `app_config`    | `components/app_config/`          | Pin definitions, includes `BATTERY_ADC_PIN` |
-| `audio`         | `components/audio/`               | I2S + ES8311                               |
+| `audio`         | `components/audio/`               | I2S + ES8311 + `audio_set_volume()` (slider) |
 | `battery_monitor` | `components/battery_monitor/`   | NEW — ADC oneshot battery gauge            |
 | `clock_weather` | `components/clock_weather/`       | SNTP, weather fetch, **periodic battery task** |
 | `display`       | `components/display/`             | ST7789 SPI                                 |
 | `encoder`       | `components/encoder/`             | EC11 + KEY0                                |
-| `ui`            | `components/ui/`                  | LVGL/EEZ flow, image assets                |
+| `ui`            | `components/ui/`                  | LVGL/EEZ flow, slider callbacks, image assets |
 | `websocket_client` | `components/websocket_client/` | esp_websocket_client wrapper               |
 | `wifi_station`  | `components/wifi_station/`        | STA connect                                |
+
+## Orchestrator (Mac side, `orchestrator/` directory)
+
+**Layered + atomic design** (refactored from monolithic `agent_server.py`,
+2026-07-03):
+
+```
+orchestrator/
+├── main.py               # Entry: banner, validate, health thread, UDP broadcast, WS server
+├── config.py             # Env vars, TBR IP, SYSTEM_PROMPT, MAX_HISTORY_TURNS
+├── core/
+│   └── pipeline.py       # STT → fuzzy → agent → TTS, **tek TTS çağrısı**
+├── services/             # Atomic, birbirinden bağımsız
+│   ├── stt.py            # Whisper HTTP client (energy gate, vocab bias)
+│   ├── llm.py            # chat_stream, chat_with_tools, chat_with_tool_results
+│   ├── tts.py            # 4 backend (minimax/edge/google_cloud/gemini), **chunk 4096**
+│   ├── agent.py          # **LangGraph StateGraph** (call_llm, dispatch, should_continue)
+│   ├── spotify.py        # OAuth + Web API + 6 TOOL_SCHEMA
+│   ├── matter.py         # TBR LED wrapper + 4 TOOL_SCHEMA
+│   ├── weather.py        # open-meteo HTTP + TOOL_SCHEMA_GET_CURRENT
+│   └── time.py           # now()/today() + TOOL_SCHEMA
+├── network/              # Network I/O katmanı
+│   ├── websocket.py      # handle_client, _Recorder, state
+│   ├── health.py         # REST endpoints (lazy import circular safe)
+│   └── discovery.py      # UDP broadcaster (mDNS yerine)
+└── utils/                # Saf DSP
+    ├── audio.py          # stereo_to_mono, normalize, resample, **soft_limit**
+    └── normalization.py  # fuzzy match, clean_text_for_tts (°C → "derece")
+```
+
+**Atomic tasarım prensibi:** Her modül tek concern. Yeni tool ekle →
+`services/yeni_tool.py` yaz, `_TOOL_MODULES`'a ekle, agent otomatik keşfeder.
+
+**LangGraph StateGraph** (`services/agent.py`):
+```
+START → call_llm → [tool_calls?] → dispatch → call_llm → ... → END
+                ↓
+            (max 3 iter guard)
+```
+MAX_ITERATIONS=3 — "yarın hava yağmurluysa müziği durdur" gibi zincirler için.
+
+**Run command** (canonical):
+```bash
+cd ~/arkadash
+source orch/bin/activate
+PYTHONDONTWRITEBYTECCODE=1 python -m orchestrator.main
+```
+
+## Voice Pipeline Tuning (NİHAİ 2026-07-04)
+
+**Sorun:** Uzun TTS cevaplarında (15s+) cümle drop, P4 log'da "Buffer underflow".
+
+**Denenen ve BAŞARISIZ olan pacing değerleri:**
+- 0.005/0.015/0.030/0.060/0.045 (sabit pacing) — ya drop ya jitter
+- dinamik pacing (ses × 0.95) — chunk boyutuna göre değişken, jitter
+- adaptive (initial burst + steady) — initial chunk trick da bozdu
+- Cümle bazlı TTS — her cümlede 2.5s latency → 2. cümle drop
+
+**ÇÖZÜM (nihai):**
+1. **Tek TTS çağrısı** — tüm yanıt tek ses sentezi, cümle bazlı YOK
+2. **pacing = 0.060s sabit** + **chunk_size = 4096** (TTS backend)
+3. **tts_start sonrası 50ms bekleme** (P4 firmware settle)
+4. **P4 firmware stabil:** queue 128 + DMA 12 + WS buffer 8192
+
+**Pacing matematiği:**
+- 4096 byte / 0.060s = 68 KB/s gönderim
+- DMA consume 32 KB/s → net 36 KB/s birikim
+- 5 saniyelik cümle = 180 KB birikim, queue 512 KB kapasiteli → OK
+- Hafif jitter WS frame overhead'inden (~1-5ms), tolere edilebilir
+
+**Neden cümle bazlı TEMSİL OLMAZ:**
+- Her cümle = ayrı TTS API + ffmpeg decode = 2-2.5s latency
+- Bu latency boyunca P4 ring buffer tükenir (2.5s × 32 KB/s = 80 KB)
+- Sonraki cümle ilk chunk geldiğinde ring buffer boş → drop
+- Tek TTS çağrısı = tek 2.5s latency (cevap başında, ring buffer zaten boş, sorun yok)
+
+**Kanıt:** 2026-07-04 16:46 verified 22.58s tool call cevabı 722462 byte tam oynandı.
+
+**Yapılmayacaklar** (denenmiş, bozmuş):
+- Pacing 0.030'a düşürme → drop (queue underflow)
+- Pacing 0.090'a yükseltme → jitter (queue overflow)
+- chunk_size 1024'e indirme → pacing tutarsız, jitter
+- "Buffer underflow" log'unu Pacing ile çözme — bu cümle drop'u işareti, gerçek çözüm P4 firmware'de
 
 ## Known Issues / TODOs (user requested 2026-06-11)
 
@@ -117,73 +213,54 @@ Logda `Silent audio, skipping` çok sık çıkıyorsa eşik fazla yüksek.
 **voice_server.py**: AYNI dizinde ama artık kullanılmıyor (`agent_server.py` canonical).
 Eski parametreler korundu, dokunma.
 
-## LangGraph Migration Plan (2026-07-01)
+## LangGraph StateGraph (DONE 2026-07-03)
 
-**Hedef:** `agent_server.py`'yi gerçek LangGraph orchestrator'a çevirmek.
-Şu an basit asyncio pipeline, `AssistantState` placeholder sınıf. Yorumlarda
-"LangGraph-like flow" yazıyor ama gerçek LangGraph değil.
+**Durum:** ✅ Tamamlandı — `services/agent.py` gerçek LangGraph StateGraph kullanıyor.
 
-**Neden:**
-- LangGraph öğrenme amaçlı (kullanıcı bildirdi)
-- İleride multi-step agent, tool calling, memory orchestration
+**Mimari:**
+```python
+from langgraph.graph import StateGraph, END, START
+class AgentState(TypedDict, total=False):
+    session_id: str; user_text: str; tool_calls: list
+    tool_results: list; final_text: str; iteration: int
 
-**Aşamalar (önerilen sıra):**
-1. ✅ **STT/LLM/TTS pipeline iyileştirmesi** — orchestrator'dan bağımsız, şu an yapılıyor
-2. ⏳ **LLM tool calling** — `led_toggle`, `led_set_color`, `led_set_brightness`, Spotify, hava durumu
-   - Bağımlılık: MiniMax API'nin tool/function calling desteği henüz doğrulanmadı
-3. ⏳ **Gerçek StateGraph** — `StateGraph` typed state, nodes (stt/llm/tools/tts), edges, conditional routing
-4. ⏳ **Persistent state** — Redis/SQLite checkpoint, conversation recovery
-5. ⏳ **Human-in-the-loop** — interrupt, approve before tool call
-
-**Refactor notu:** `agent_server.py` 1375 satır, LangGraph geçişinde büyük ihtimalle
-yeniden yapılandırılacak. Şu anki "tek dosya her şey" yapısı orchestrator için uygun değil.
-
-## P4 Audio Buffer Tuning (TODO 2026-07-01)
-
-**Sorun:** Uzun TTS cevaplarında (15s+) ses karışıyor veya kesiliyor, P4 log:
-```
-W ws_client: Ring buffer full, dropped N bytes
+# Nodes: call_llm, dispatch
+# Conditional: should_continue → "dispatch" | "end"
+# MAX_ITERATIONS = 3
 ```
 
-**Sebep:** P4'ün iki buffer'ı yetmiyor:
-- `ws_client` ring buffer (default ~küçük) — TTS PCM'i düşürmeden depolayamıyor
-- `i2s_common` DMA buffers (`6 desc x 240 frame` log'da) — PCM'i DMA'ya koymadan yetiştiremiyor
+**Tool keşif** (`services/agent.py:_discover_tools`):
+- `_TOOL_MODULES = [weather, time_svc, matter, spotify]`
+- Her modülün `TOOL_SCHEMA_X` dict'leri otomatik toplanır
+- Schema `name = "module.func"` → dispatch `func = getattr(module, "func")`
+- Yeni tool ekle: `services/yeni.py` + `_TOOL_MODULES`'a ekle, otomatik çalışır
 
-**2026-07-01 bulgu (kaynak: github.com/iotosphere/arkadash):**
-Çözüm P4 firmware `components/websocket_client/websocket_client.c`'de **3 değişiklik**:
-1. **64 KB static ring buffer** (TTS PCM için):
-   ```c
-   static uint8_t s_rb_storage[65536];
-   xRingbufferCreateStatic(sizeof(s_rb_storage), RINGBUF_TYPE_BYTEBUF, ...);
-   ```
-2. **ESP-IDF WebSocket client `buffer_size = 8192`**:
-   ```c
-   esp_websocket_client_config_t ws_cfg = {
-       .uri         = uri,
-       .buffer_size = 8192,
-       .keep_alive_enable = true,
-       .reconnect_timeout_ms = 5000,
-       ...
-   };
-   ```
-3. **Ses gönderirken chunk_size 4096 + vTaskDelay 5ms**:
-   ```c
-   size_t chunk_size = 4096;
-   while (sent < audio_len) {
-       int ret = esp_websocket_client_send_bin(..., len, pdMS_TO_TICKS(5000));
-       sent += len;
-       vTaskDelay(pdMS_TO_TICKS(5));
-   }
-   ```
+**Test edilmiş tool'lar** (MiniMax M2.7 OpenAI function_calling format):
+- `time.now` / `time.today` — Türkçe haftanın günü
+- `weather.get_current` — open-meteo (API key gereksiz)
+- `led.toggle` — TBR HTTP wrapper
+- `spotify.*` — OAuth + Web API (6 tool, test edilmedi)
 
-**2026-07-01 pacing denemeleri (agent_server.py):** 0.005/0.015/0.030/0.10 denendi,
-hiçbiri sorunu kökünden çözmedi. **P4 firmware tarafında düzeltme şart**.
+**Eklenmesi planlanan tool'lar:**
+- `bitget` — kripto trading (`services/bitget.py` + `core/trade_safety.py` confirmation gate)
+- `volume.set` / `brightness.set` — P4 firmware control via WebSocket reverse channel
 
-**TODO (yarın):**
-1. `components/websocket_client/websocket_client.c` — yukarıdaki 3 değişikliği uygula
-2. (Opsiyonel) `i2s_channel_new()` DMA buffer count/len — eğer cümle tamamlanma hâlâ bozuksa
-3. Build + flash + test (uzun TTS cümlesi ile dene)
+## P4 Audio Buffer Tuning (ÇÖZÜLDÜ 2026-07-04)
 
-**Trade-off:** 64 KB static ring buffer → ~64 KB RAM kullanımı. P4'te 32 MB PSRAM var,
-yeterli headroom. Static allocation tercih edilir (heap fragmentation önler).
+**Durum:** ✅ Çözüldü — yukarıdaki "Voice Pipeline Tuning (NİHAİ)" bölümüne bak.
+
+**Sorun:** Uzun TTS cevaplarında cümle drop, "Buffer underflow, continuing..."
+
+**Çözüm kombinasyonu** (Python + firmware):
+1. **Tek TTS çağrısı** (`orchestrator/core/pipeline.py`) — cümle bazlı değil
+2. **pacing 0.060s + chunk 4096** (`services/tts.py`)
+3. **tts_start sonrası 50ms bekleme** (P4 firmware settle)
+4. **P4 firmware stabil hali:** `components/websocket_client/websocket_client.c`
+   queue 128 + WS buffer 8192, `components/audio/audio.c` DMA 12 desc + ES8311 volume 65
+
+**ASLA YAPMA** (denenmiş, drop yaratıyor):
+- Pacing 0.030 veya daha hızlı → ring buffer underflow
+- Cümle bazlı TTS → her cümlede 2.5s latency, sonraki cümle drop
+- chunk_size 1024 → pacing tutarsız
+- "Buffer underflow" log'unu pacing ile çözme — bu gerçek cümle drop işareti
 
